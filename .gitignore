@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+
+# Build output
+/build/
+/build-*/
+/DerivedData/
+cmake-build-*/
+*.o
+*.a
+*.dylib
+
+# Xcode
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+
+# Local agent settings
+/.claude/
+
+# Scratch
+*.tmp
+*.log
+
+# Fetched GPL reference drivers (run scripts/fetch-refs.sh) — not versioned here.
+/ref/
+
+# editor swap files
+*.swp
+*.swo
+
+# Xcode per-user state
+platform/ohci-dext/UFFireWireOHCI.xcodeproj/xcuserdata/
+platform/ohci-dext/UFFireWireOHCI.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Loader build output
+platform/loader/build/
+
+# Dext compile-check output (scripts/../platform/ohci-dext/build.sh)
+platform/ohci-dext/build/

@@ -1,0 +1,22 @@
+UserFace800 — userland macOS driver for the RME Fireface 800
+Copyright (c) 2026 userface800
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License version 2 as published by the Free
+Software Foundation. See LICENSE for the full text.
+
+Version 2 only, not "version 2 or later": this work derives from Linux's
+snd-fireface, which is GPL-2.0-only.
+
+
+Upstream sources this work derives from
+---------------------------------------
+  Linux snd-fireface          GPL-2.0-only          streaming, MIDI, clock,
+                                                    register sequences
+  Linux firewire core / ohci  GPL-2.0, -or-later    1394 OHCI programming model,
+                                                    async transactions, self-ID
+  FFADO (libffado)            GPL-2.0-or-later      extended settings, TotalMix
+                                                    matrix mixer maths
+
+Each file that derives from one of these carries an attribution header naming
+the upstream file and its licence. Keep that up when porting anything new.

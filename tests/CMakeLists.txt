@@ -1,0 +1,25 @@
+# Unit tests for the portable protocol core. Each test_<module>.cpp becomes a ctest case.
+# Add a line per module as tasks land.
+function(uf_add_test name)
+    add_executable(${name} ${name}.cpp)
+    target_link_libraries(${name} PRIVATE uf_protocol)
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+uf_add_test(test_endian)
+uf_add_test(test_identity)
+uf_add_test(test_registers)
+
+uf_add_test(test_rate)
+uf_add_test(test_status)
+uf_add_test(test_settings)
+uf_add_test(test_clock)
+uf_add_test(test_mixer)
+uf_add_test(test_control)
+uf_add_test(test_channels)
+uf_add_test(test_codec)
+uf_add_test(test_midi)
+uf_add_test(test_stream)
+uf_add_test(test_wav)
+uf_add_test(test_txnlog)
