@@ -21,13 +21,40 @@ enum class BwLimit {
 };
 
 // Frames (data blocks) per isochronous packet by speed (spec/03 §3.2): 1x=7, 2x=15, 4x=25.
+// Frames in a FULL packet. The FF800 streams in CIP blocking mode (ref/snd-fireface amdtp-ff.c:
+// CIP_BLOCKING|CIP_UNAWARE_SYT|CIP_NO_HEADER), so each packet carries exactly this many frames or 0
+// (empty), and empty packets pad down to the rate/8000 average. This is the AMDTP syt_interval,
+// [HW-CONFIRMED] on the FF800 (a 48 kHz capture packet = 8 frames = 896 B/28ch). Corrects spec/03's
+// 7/15/25.
 constexpr u32 frames_per_packet(Speed s) {
     switch (s) {
-        case Speed::X1: return 7;
-        case Speed::X2: return 15;
-        case Speed::X4: return 25;
+        case Speed::X1: return 8;    // 32/44.1/48 kHz
+        case Speed::X2: return 16;   // 88.2/96 kHz
+        case Speed::X4: return 32;   // 176.4/192 kHz
     }
     return 0;
+}
+
+// Average frames per isochronous cycle (8000 cycles/s) — integer for the 48 k family, fractional for
+// the 44.1 k family (44100/8000 = 5.5125), which is why the blocking cadence needs a whole period.
+constexpr u32 avg_frames_per_cycle(u32 rate_hz) { return rate_hz / 8000; }
+
+// The blocking transmit cadence repeats over this many packets. 640 is the exact period for EVERY
+// FF800 native rate: rate*640/(8000*syt_interval) is a whole number of full packets for 32/44.1/48/
+// 88.2/96/176.4/192 kHz (the 48 k family's period is 4, which divides 640). So a 640-packet ring
+// reproduces 44.1 kHz exactly (5.5125 fr/cyc), not just the clean rates.
+inline constexpr u32 kBlockingRingLen = 640;
+
+// Number of FULL (syt_interval-frame) packets in one 640-packet ring for this rate; the rest are empty.
+constexpr u32 blocking_full_count(u32 rate_hz, Speed s) {
+    return rate_hz * kBlockingRingLen / (8000u * frames_per_packet(s));
+}
+
+// Is packet `i` of the ring a full packet? Bresenham distribution of `full_count` full packets across
+// `ring_len` — spreads them evenly so the device's buffer never sees a long run of empties. The dext
+// (programming descriptors) and the daemon (filling only full slots) MUST agree via this one function.
+constexpr bool is_full_packet(u32 i, u32 full_count, u32 ring_len = kBlockingRingLen) {
+    return (i + 1) * full_count / ring_len > i * full_count / ring_len;
 }
 
 // Analog channel count for a mode (spec/08 §8.3): AnalogOnly = 8 (channels 1-8), else 10.

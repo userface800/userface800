@@ -28,6 +28,13 @@ inline constexpr Addr kIsocCommStart = 0xfc88f00c;   // W: 0x80000000 | dbq | (S
 inline constexpr Addr kIsocCommStop = 0xfc88f010;    // W: 0x80000000
 inline constexpr Addr kConfBlock = 0xfc88f014;       // W(3 quad): CR0/CR1/CR2 settings block
 
+// The FF800 also accepts streaming setup through the 0x0002 command bank instead of the fc88f…
+// bank above; both work on hardware. On this bank the init is one 3-quad block, not three separate
+// writes.
+inline constexpr Addr kInitBankStream = 0x20000001c; // W(3 quad): {rate, (dbq<<11)|rxCh, dbq[|0x800]}
+inline constexpr Addr kInitBankStart  = 0x200000028; // W: 0x80000000 | dbq | (S800?0x800:0)
+inline constexpr Addr kInitBankStop   = 0x200000034; // W(3 quad): stop blob (three zero quadlets)
+
 // Status / control surface.
 inline constexpr Addr kStatus0 = 0x801c0000;         // R: SR0; W: channel-mute mask
 inline constexpr Addr kClockConfig = 0x801c0004;     // R/W: clock config + SR1
@@ -41,6 +48,14 @@ inline constexpr Addr kMidiOut = 0x80180000;         // W: MIDI out (host->devic
 inline constexpr Addr kMidiHighAddr = 0x200000320;   // W: MIDI host-receive high-addr register
 inline constexpr Addr kFirmwareRev = 0x200000100;    // R: firmware revision
 inline constexpr Addr kHostLed = 0x200000324;        // W: host LED
+
+// FF800 flash (persist settings to device NVRAM; facts from FFADO fireface_flash.cpp). Erase = write
+// 0 to the erase reg then poll SR1 bit 30; read/write the data region in <=256 B (64-quad) sectors.
+inline constexpr Addr kFlashSettings   = 0x3000f0000; // R/W: settings record (survives power-off)
+inline constexpr Addr kFlashMixerShadow = 0x3000e0000;// R/W: mixer state (0x2000 bytes)
+inline constexpr Addr kFlashEraseSettings = 0x3fffffff0; // W 0: erase the settings block
+inline constexpr u32  kFlashBusyBit    = 0x40000000;  // SR1 (0x801c0004) bit: set = flash ready
+inline constexpr u32  kFlashSectorQuads = 64;         // 256-byte flash sector
 
 }  // namespace reg
 

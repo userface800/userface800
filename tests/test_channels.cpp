@@ -27,14 +27,15 @@ UF_TEST(bandwidth_limit_modes) {
 }
 
 UF_TEST(frames_and_payload) {
-    UF_CHECK_EQ(frames_per_packet(Speed::X1), 7u);
-    UF_CHECK_EQ(frames_per_packet(Speed::X2), 15u);
-    UF_CHECK_EQ(frames_per_packet(Speed::X4), 25u);
-    // spec/09 §9.5: 28 * 4 * 7 = 784 bytes at 1x send-all.
-    UF_CHECK_EQ(packet_payload_bytes(Speed::X1), 784u);
-    // 20 * 4 * 15 = 1200 at 2x; 12 * 4 * 25 = 1200 at 4x (spec/03 §3.2).
-    UF_CHECK_EQ(packet_payload_bytes(Speed::X2), 1200u);
-    UF_CHECK_EQ(packet_payload_bytes(Speed::X4), 1200u);
+    // Full-packet block size = AMDTP syt_interval (blocking mode), HW-confirmed; corrects spec's 7/15/25.
+    UF_CHECK_EQ(frames_per_packet(Speed::X1), 8u);
+    UF_CHECK_EQ(frames_per_packet(Speed::X2), 16u);
+    UF_CHECK_EQ(frames_per_packet(Speed::X4), 32u);
+    // Full-packet payload = channels * 4 * syt_interval (blocking, HW-confirmed): 28*4*8 = 896 @ 1x.
+    UF_CHECK_EQ(packet_payload_bytes(Speed::X1), 896u);
+    // 20 * 4 * 16 = 1280 @ 2x; 12 * 4 * 32 = 1536 @ 4x.
+    UF_CHECK_EQ(packet_payload_bytes(Speed::X2), 1280u);
+    UF_CHECK_EQ(packet_payload_bytes(Speed::X4), 1536u);
 }
 
 UF_TEST(dbq_and_bandwidth) {
@@ -43,8 +44,8 @@ UF_TEST(dbq_and_bandwidth) {
     UF_CHECK_EQ(pcm_channels_for_rate(48000), 28u);
     UF_CHECK_EQ(pcm_channels_for_rate(96000), 20u);
     UF_CHECK_EQ(pcm_channels_for_rate(192000), 12u);
-    // spec/09 §9.4: bandwidth = 25 + 28*4*7 = 809 units at 1x.
-    UF_CHECK_EQ(bandwidth_units(Speed::X1), 809u);
+    // bandwidth = 25 + full-packet payload = 25 + 28*4*8 = 921 units at 1x (blocking full packet).
+    UF_CHECK_EQ(bandwidth_units(Speed::X1), 921u);
 }
 
 // ── Channel ordering ─────────────────────────────────────────────────────────────────────

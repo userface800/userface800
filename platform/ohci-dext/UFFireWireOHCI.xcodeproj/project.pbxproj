@@ -1,0 +1,164 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		100000000000000000000C1 /* UFFireWireOHCI.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000B1 /* UFFireWireOHCI.cpp */; };
+		100000000000000000000C2 /* UFFireWireOHCI.iig in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000B2 /* UFFireWireOHCI.iig */; };
+		100000000000000000000C5 /* UFFireWireOHCIUserClient.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000B5 /* UFFireWireOHCIUserClient.cpp */; };
+		100000000000000000000C6 /* UFFireWireOHCIUserClient.iig in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000B6 /* UFFireWireOHCIUserClient.iig */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		100000000000000000000B1 /* UFFireWireOHCI.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = UFFireWireOHCI.cpp; sourceTree = "<group>"; };
+		100000000000000000000B2 /* UFFireWireOHCI.iig */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.iig; path = UFFireWireOHCI.iig; sourceTree = "<group>"; };
+		100000000000000000000B5 /* UFFireWireOHCIUserClient.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = UFFireWireOHCIUserClient.cpp; sourceTree = "<group>"; };
+		100000000000000000000B6 /* UFFireWireOHCIUserClient.iig */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.iig; path = UFFireWireOHCIUserClient.iig; sourceTree = "<group>"; };
+		100000000000000000000B3 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		100000000000000000000B4 /* UFFireWireOHCI.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = UFFireWireOHCI.entitlements; sourceTree = "<group>"; };
+		100000000000000000000D1 /* UFFireWireOHCI.dext */ = {isa = PBXFileReference; explicitFileType = wrapper.driver-extension; includeInIndex = 0; path = UFFireWireOHCI.dext; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		100000000000000000000AA /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		100000000000000000000A2 /* Main */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000B1 /* UFFireWireOHCI.cpp */,
+				100000000000000000000B2 /* UFFireWireOHCI.iig */,
+				100000000000000000000B3 /* Info.plist */,
+				100000000000000000000B4 /* UFFireWireOHCI.entitlements */,
+				100000000000000000000A3 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		100000000000000000000A3 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000D1 /* UFFireWireOHCI.dext */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		100000000000000000000A4 /* UFFireWireOHCI */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000A6 /* Build configuration list for PBXNativeTarget "UFFireWireOHCI" */;
+			buildPhases = (
+				100000000000000000000A9 /* Sources */,
+				100000000000000000000AA /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = UFFireWireOHCI;
+			productName = UFFireWireOHCI;
+			productReference = 100000000000000000000D1 /* UFFireWireOHCI.dext */;
+			productType = "com.apple.product-type.driver-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		100000000000000000000A1 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2660;
+			};
+			buildConfigurationList = 100000000000000000000A5 /* Build configuration list for PBXProject "UFFireWireOHCI" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 100000000000000000000A2 /* Main */;
+			productRefGroup = 100000000000000000000A3 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				100000000000000000000A4 /* UFFireWireOHCI */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		100000000000000000000A9 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000C2 /* UFFireWireOHCI.iig in Sources */,
+				100000000000000000000C1 /* UFFireWireOHCI.cpp in Sources */,
+				100000000000000000000C6 /* UFFireWireOHCIUserClient.iig in Sources */,
+				100000000000000000000C5 /* UFFireWireOHCIUserClient.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		100000000000000000000A7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = driverkit;
+				SUPPORTED_PLATFORMS = driverkit;
+			};
+			name = Debug;
+		};
+		100000000000000000000A8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				AD_HOC_CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGN_ENTITLEMENTS = UFFireWireOHCI.entitlements;
+				DRIVERKIT_DEPLOYMENT_TARGET = 24.0;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/../../include";
+				INFOPLIST_FILE = Info.plist;
+				OTHER_LDFLAGS = "-framework PCIDriverKit";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.userface800.UFLoader.UFFireWireOHCI";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		100000000000000000000A5 /* Build configuration list for PBXProject "UFFireWireOHCI" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				100000000000000000000A7 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		100000000000000000000A6 /* Build configuration list for PBXNativeTarget "UFFireWireOHCI" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				100000000000000000000A8 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 100000000000000000000A1 /* Project object */;
+}

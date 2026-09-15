@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.userface800.UFLoader.UFFireWireOHCI</string>
+    <key>CFBundleName</key>
+    <string>UFFireWireOHCI</string>
+    <key>CFBundleVersion</key>
+    <string>0.0.1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.1</string>
+    <key>CFBundleExecutable</key>
+    <string>UFFireWireOHCI</string>
+    <key>CFBundlePackageType</key>
+    <string>DEXT</string>
+    <key>OSBundleUsageDescription</key>
+    <string>Userland 1394 OHCI driver for the RME Fireface 800 (UserFace800).</string>
+    <key>OSMinimumDriverKitVersion</key>
+    <string>24.0</string>
+    <key>IOKitPersonalities</key>
+    <dict>
+        <key>UFFireWireOHCI</key>
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.userface800.UFLoader.UFFireWireOHCI</string>
+            <key>IOClass</key>
+            <string>IOUserService</string>
+            <key>IOUserClass</key>
+            <string>UFFireWireOHCI</string>
+            <key>IOProviderClass</key>
+            <string>IOPCIDevice</string>
+            <!-- Match any 1394 OHCI controller (base 0x0c / sub 0x00 / prog-if 0x10),
+                 revision byte masked. Confirmed target here: LSI FW643 0x11c1:0x5901. -->
+            <key>IOPCIClassMatch</key>
+            <string>0x0c001000&amp;0xffffff00</string>
+            <!-- Required to bind a Thunderbolt-tunneled PCI device. -->
+            <key>IOPCITunnelCompatible</key>
+            <true/>
+            <key>IOUserServerName</key>
+            <string>com.userface800.UFLoader.UFFireWireOHCI</string>
+            <key>IOMatchCategory</key>
+            <string>com.userface800.UFLoader.UFFireWireOHCI</string>
+            <key>UserClientProperties</key>
+            <dict>
+                <key>IOClass</key>
+                <string>IOUserUserClient</string>
+                <key>IOUserClass</key>
+                <string>UFFireWireOHCIUserClient</string>
+            </dict>
+        </dict>
+    </dict>
+</dict>
+</plist>

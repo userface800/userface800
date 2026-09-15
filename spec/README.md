@@ -1,7 +1,8 @@
 # Fireface 800 macOS userland driver — specification
 
 This folder is the **authoritative, implementation-facing specification** for a userland macOS
-driver for the RME Fireface 800 (FF800). It states *what to build* in normative terms.
+driver for the RME Fireface 800 (FF800). It states *what to build* in normative terms: addresses,
+bit layouts, packet geometry, sequences.
 
 ## Reuse policy
 **Reuse and adapt the reference drivers freely** — they are working, correct code.
@@ -16,20 +17,23 @@ Licensing and attribution: `../COPYRIGHT`.
 
 ## Provenance & confidence
 Protocol facts here are cross-checked where possible against the Linux **FFADO** driver
-(`ref/libffado-2.4.9/src/rme`) and the Linux kernel **snd-fireface** driver (`ref/snd-fireface`).
-Untagged statements are settled. Tags:
+(`ref/libffado-2.4.9/src/rme`), the Linux kernel **snd-fireface** driver (`ref/snd-fireface`), and
+the device's own behaviour on hardware. Untagged statements are settled. Tags:
 - **[F]** from one OSS reference (FFADO or snd-fireface), not independently corroborated here.
 - **[?]** open / unverified / references disagree — must be resolved before relying on it.
+- **[HW-CONFIRMED]** observed directly on an FF800.
 
 ## Documents
 - `01_transport.md` — FireWire async + isochronous primitives, the 48-bit address model.
 - `02_control_registers.md` — full register map, the shadow-config write model, clock/sync, mixer.
 - `03_streaming.md` — iso packet format, per-speed channel maps, sample encoding, stream lifecycle.
-- `04_midi.md` — MIDI transport over FireWire (the one partially-open area).
-- `06_bitfields.md` — complete CR0/CR1/CR2 + SR0/SR1 bit tables (transcribed).
+- `04_midi.md` — MIDI transport over FireWire.
+- `06_bitfields.md` — complete CR0/CR1/CR2 + SR0/SR1 bit tables.
 - `07_mixer.md` — matrix mixer addressing + coefficient/dB encoding.
 - `08_channel_maps.md` — per-speed / per-bandwidth-mode channel maps + slot ordering.
 - `09_worked_examples.md` — concrete register sequences / test vectors to validate against.
+- `10_metering.md` — level-meter data format + the meter region on the wire.
+- `11_flash.md` — on-device settings/mixer flash.
 
 ## Scope
 - **In scope:** a userland (no kext) macOS driver exposing the FF800 to Core Audio and CoreMIDI —
@@ -46,4 +50,4 @@ Untagged statements are settled. Tags:
    a DCL program; software only stages buffers.
 3. The **daemon owns the device**; the AudioServerPlugIn (in `coreaudiod`) only declares formats
    and moves bytes through a lock-free shared-memory ring. No blocking in the RT IO path.
-4. FFADO is GPL. Code ported from `ref/libffado` inherits GPL — relevant only if distributed.
+4. FFADO is GPL. Code ported from `ref/libffado` inherits GPL (used at v2; see `../COPYRIGHT`).

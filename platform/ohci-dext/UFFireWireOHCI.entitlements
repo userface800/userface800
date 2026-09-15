@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Base DriverKit entitlement. -->
+    <key>com.apple.developer.driverkit</key>
+    <true/>
+    <!-- PCI transport family — REQUIRED to bind an IOPCIDevice. This is a *restricted* entitlement
+         for the notarized path. UserFace800 is built from source, so no Apple approval /
+         provisioning profile is needed: each user builds locally and ad-hoc signs with SIP off + developer mode,
+         and no AMFI boot-arg (see platform/loader/LOADING.md). -->
+    <key>com.apple.developer.driverkit.transport.pci</key>
+    <array>
+        <dict>
+            <!-- Match our confirmed controller (and any 1394 OHCI). PCIDeviceID/Vendor pairs the
+                 entitlement permits us to claim. 0x5901 = device, 0x11c1 = vendor (LSI FW643). -->
+            <key>IOPCIClassMatch</key>
+            <string>0x0c001000&amp;0xffffff00</string>
+        </dict>
+    </array>
+    <!-- Let our userland driver (UFAsyncIO) open a user client against this dext. -->
+    <key>com.apple.developer.driverkit.allow-any-userclient-access</key>
+    <true/>
+</dict>
+</plist>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Lets this app install/activate a system (driver) extension. Restricted like the dext's
+         entitlement; honored on an ad-hoc signed build with SIP off + developer mode
+         (see LOADING.md). -->
+    <key>com.apple.developer.system-extension.install</key>
+    <true/>
+</dict>
+</plist>

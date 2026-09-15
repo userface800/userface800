@@ -30,4 +30,22 @@ if [ ! -d "$sf" ]; then
   done
 fi
 
+# firewire-ohci (GPL-2.0, mainline Linux) — the PRIMARY reference for the userland OHCI transport
+# (PCIDriverKit dext): controller init, self-ID/bus-reset, async (AT/AR) + isoch (IT/IR) DMA
+# contexts, and the 1394 packet-header/phy-packet field layouts. We port this into platform/ohci-dext.
+fo="$ref/firewire-ohci"
+if [ ! -d "$fo" ]; then
+  echo "Fetching firewire-ohci (Linux drivers/firewire) ..."
+  mkdir -p "$fo"
+  fw="https://raw.githubusercontent.com/torvalds/linux/master/drivers/firewire"
+  inc="https://raw.githubusercontent.com/torvalds/linux/master/include/linux"
+  uapi="https://raw.githubusercontent.com/torvalds/linux/master/include/uapi/linux"
+  for f in ohci.c ohci.h core.h core-transaction.c core-topology.c core-card.c core-iso.c \
+           packet-header-definitions.h phy-packet-definitions.h packet-serdes-test.c; do
+    curl -fsSL -o "$fo/$f" "$fw/$f" || echo "  (skip $f)"
+  done
+  curl -fsSL -o "$fo/firewire.h" "$inc/firewire.h" || true
+  curl -fsSL -o "$fo/firewire-constants.h" "$uapi/firewire-constants.h" || true
+fi
+
 echo "References ready in $ref:"; ls "$ref"
