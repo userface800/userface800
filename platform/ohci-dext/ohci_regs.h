@@ -44,6 +44,11 @@
 #define   Int_regAccessFail         (1u << 18)
 #define   Int_unrecoverableError    (1u << 24)
 #define   Int_cycleTooLong          (1u << 25)   // hardware clears cycleMaster; we must restore it
+// Isochronous completion. These two are the logical OR of the per-context IsoXmit/IsoRecvIntEvent
+// bits, so they are NOT clearable through IntEventClear — the per-context register must be cleared
+// instead, or the top-level bit stays asserted and the controller re-interrupts forever.
+#define   Int_isochTx               (1u << 6)
+#define   Int_isochRx               (1u << 7)
 
 // PHY access + link control.
 #define OHCI_PhyControl         0x0EC
@@ -114,6 +119,7 @@
 #define OHCI_IR_CTX_BASE(n)        (0x400 + 32 * (n))   // SET=+0 CLEAR=+4 CMDPTR=+12 MATCH=+16
 #define OHCI_IsoXmitIntEventClear  0x094
 #define OHCI_IsoXmitIntMaskSet     0x098
+#define OHCI_IsoXmitIntMaskClear   0x09C
 #define OHCI_IT_CTX_BASE(n)        (0x200 + 16 * (n))   // SET=+0 CLEAR=+4 CMDPTR=+12
 // IT packet header (ohci.h OHCI1394_IT_DATA_*): q0 = spd|tag|channel|tcode|sy, q1 = length<<16.
 #define IT_HDR_Q0(spd, tag, ch, sy) \

@@ -93,16 +93,19 @@ UF_TEST(timestamp_concurrent_never_torn) {
     std::thread pub([&]{
         for (uint64_t i = 1; i <= 200000; ++i) r.publishTimestamp((double)i, i * 1000ull);
     });
-    // The consumer must only ever see a coherent pair: hostTime == sampleTime*1000.
-    int reads = 0;
+    // The consumer must only ever see a coherent pair: hostTime == sampleTime*1000. Record a tear
+    // rather than throwing here — a CHECK would unwind past pub.join() and terminate on the still
+    // joinable thread, turning a plain test failure into a crash with no diagnostic.
+    int reads = 0, torn = 0;
     for (int i = 0; i < 500000; ++i) {
         double st; uint64_t ht, seed;
         if (r.readTimestamp(&st, &ht, &seed)) {
-            UF_CHECK((uint64_t)st * 1000ull == ht);   // never a torn mix of two publishes
+            if ((uint64_t)st * 1000ull != ht) ++torn;   // a torn mix of two publishes
             ++reads;
         }
     }
     pub.join();
+    UF_CHECK_EQ(torn, 0);
     UF_CHECK(reads > 0);
 }
 

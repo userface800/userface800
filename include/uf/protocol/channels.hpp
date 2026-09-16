@@ -135,14 +135,69 @@ inline std::vector<ChannelSlot> channel_map(Direction dir, Speed s, BwLimit m = 
 }
 
 // Human-readable channel name for CoreAudio naming.
+//
+// These are the channel names the device ships with, verbatim. Matching them exactly matters more
+// than picking nicer words: a DAW session saved against the factory driver remembers its inputs by
+// name, so "Mic 9" and "Analog 9" are the difference between a project re-opening with its routing
+// intact and the user rebuilding it by hand.
+//
+// The two that are not what you would guess: input slots 9/10 are the FF800's mic inputs ("Mic 9",
+// "Mic 10") while the same slots on output are the headphone sends ("Phones 9", "Phones 10", NOT
+// L/R) — which is exactly the capture/playback split channel_map() already encodes. SPDIF is L/R
+// rather than numbered.
 inline std::string channel_name(ChannelSlot sl) {
     switch (sl.kind) {
-        case ChannelKind::Analog: return "Analog " + std::to_string(sl.index);
-        case ChannelKind::Phones: return sl.index == 1 ? "Phones L" : "Phones R";
-        case ChannelKind::Spdif: return "SPDIF " + std::to_string(sl.index);
+        case ChannelKind::Analog:
+            return (sl.index >= 9 ? "Mic " : "Analog ") + std::to_string(sl.index);
+        case ChannelKind::Phones: return "Phones " + std::to_string(sl.index + 8);
+        case ChannelKind::Spdif: return sl.index == 1 ? "SPDIF L" : "SPDIF R";
         case ChannelKind::Adat: return "ADAT " + std::to_string(sl.index);
     }
     return "?";
+}
+
+// The group a channel belongs to, for CoreAudio's element *category* name — the label Audio MIDI
+// Setup puts above a block of channels. The factory driver shows four per direction, because it
+// publishes one stream per group: Analog 1-8, Phones/Mic 9-10, SPDIF, ADAT.
+//
+// These are also the boundaries along which channels disappear as the rate rises — ADAT halves at 2x
+// and vanishes at 4x, leaving the other three groups untouched — which is why the FF800 is a 24-channel
+// device in practice (8 analog + 2x8 ADAT) with four channels of phones/SPDIF always along for the ride.
+inline std::string channel_group_name(ChannelSlot sl) {
+    switch (sl.kind) {
+        case ChannelKind::Analog: return sl.index >= 9 ? "Mic" : "Analog";
+        case ChannelKind::Phones: return "Phones";
+        case ChannelKind::Spdif: return "SPDIF";
+        case ChannelKind::Adat: return "ADAT";
+    }
+    return "?";
+}
+
+// A contiguous run of channels of one kind, as CoreAudio should see it: one stream per group, which
+// is what the factory driver publishes too — one stream per (start, count) pair below.
+struct ChannelGroup {
+    std::string name;
+    u32 start;   // 1-based channel number of the first channel in the group
+    u32 count;
+};
+
+// Split a channel map into its groups. Boundaries are kind changes, plus the analog 1-8 / 9-10 split
+// that RME shows separately (mic ins on capture, phones on playback). These are also the boundaries
+// channels disappear along as the rate rises — ADAT halves at 2x and is gone at 4x — so a speed
+// change resizes or removes whole groups instead of renumbering a flat list.
+inline std::vector<ChannelGroup> channel_groups(Direction dir, Speed s,
+                                                BwLimit m = BwLimit::SendAll) {
+    const auto map = channel_map(dir, s, m);
+    std::vector<ChannelGroup> groups;
+    for (u32 i = 0; i < map.size(); ++i) {
+        const std::string g = channel_group_name(map[i]);
+        if (!groups.empty() && groups.back().name == g) {
+            ++groups.back().count;
+        } else {
+            groups.push_back({g, i + 1, 1});
+        }
+    }
+    return groups;
 }
 
 }  // namespace uf

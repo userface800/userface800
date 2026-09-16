@@ -7,6 +7,13 @@
 // OUT is fully real and testable on hardware: it block-writes to 0x80180000 via the dext.
 // IN is HARDWARE-GATED: it advertises a host receive address and polls the dext, but the dext's
 // AR-request receive path has never delivered a packet, so nothing has been received yet.
+//
+// DO NOT RUN THIS ALONGSIDE uf-daemon. The daemon now carries the same MIDI bridge internally, and
+// it is the better place for it: every register transaction goes through the dext's single AT
+// context, and two processes each holding their own user client can have their external methods
+// dispatched on separate queues, so a MIDI write and an audio-path register write can interleave
+// inside one transaction and corrupt both. This binary remains for MIDI-only work with no audio
+// session running (and as the smallest possible harness for debugging the MIDI-in path).
 #include <CoreMIDI/CoreMIDI.h>
 #include <IOKit/IOKitLib.h>
 #include <unistd.h>
@@ -88,14 +95,17 @@ int main() {
     // Poll the dext for received MIDI and forward to the CoreMIDI source.
     while (g_run.load()) {
         if (!g_conn) { usleep(50000); continue; }
-        uint8_t bytes[256];
-        size_t outLen = sizeof(bytes);
-        if (IOConnectCallMethod(g_conn, kMidiInPoll, nullptr, 0, nullptr, 0,
-                                nullptr, nullptr, bytes, &outLen) == KERN_SUCCESS && outLen > 0) {
-            std::vector<uint8_t> pktbuf(outLen + 64);
-            MIDIPacketList* pl = reinterpret_cast<MIDIPacketList*>(pktbuf.data());
+        // out: scalar[0] = count (0..8), scalar[1] = that many bytes packed low-byte-first.
+        uint64_t out[2] = {0, 0}; uint32_t n = 2;
+        if (IOConnectCallScalarMethod(g_conn, kMidiInPoll, nullptr, 0, out, &n) == KERN_SUCCESS &&
+            out[0] > 0 && out[0] <= 8) {
+            const uint32_t count = (uint32_t)out[0];
+            uint8_t bytes[8];
+            for (uint32_t i = 0; i < count; ++i) bytes[i] = (uint8_t)((out[1] >> (8 * i)) & 0xff);
+            uint8_t pktbuf[256];
+            MIDIPacketList* pl = reinterpret_cast<MIDIPacketList*>(pktbuf);
             MIDIPacket* cur = MIDIPacketListInit(pl);
-            cur = MIDIPacketListAdd(pl, pktbuf.size(), cur, 0, outLen, bytes);
+            cur = MIDIPacketListAdd(pl, sizeof(pktbuf), cur, 0, count, bytes);
             if (cur) MIDIReceived(src, pl);
         }
         usleep(2000);

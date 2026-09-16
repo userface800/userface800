@@ -12,6 +12,7 @@
 // continuous dext capture ring it drives has not run on hardware — verify the pump against a real
 // stream. This is scaffolding to iterate on with the FF800 attached, not a finished daemon.
 #include <IOKit/IOKitLib.h>
+#include <CoreMIDI/CoreMIDI.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -22,6 +23,10 @@
 #include <cmath>
 #include <atomic>
 #include <mach/mach_time.h>
+#include <mach/mach_init.h>
+#include <mach/mach_port.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
 #include <thread>
 
 #include "uf/protocol/channels.hpp"
@@ -30,12 +35,23 @@
 #include "uf/protocol/stream.hpp"
 #include "uf/protocol/rate.hpp"
 #include "uf/protocol/settings.hpp"
+#include "uf/protocol/status.hpp"
+#include "uf/protocol/control.hpp"
+#include "uf/protocol/midi.hpp"
+#include "../shared/uf_control.hpp"
 #include "../shared/uf_shm_ring.hpp"
 
-// Must match UFFireWireOHCIShared.h.
-enum { kRQ = 0, kWQ = 1, kWB = 2, kIsoStart = 3, kIsoPoll = 4, kIsoStop = 5,
-       kIsoTxStart = 6, kIsoTxStop = 7, kIsoStartCont = 8, kIsoCompleted = 9, kIsoRelease = 10,
-       kReadCycleTimer = 14 };
+// Short names for the user-client ABI. Defined in terms of the shared header rather than copied out
+// of it, so the two cannot drift.
+#include "../ohci-dext/UFFireWireOHCIShared.h"
+enum { kRQ = kUFOhciReadQuadlet, kWQ = kUFOhciWriteQuadlet, kWB = kUFOhciWriteBlock,
+       kIsoStart = kUFOhciIsoStart, kIsoPoll = kUFOhciIsoPoll, kIsoStop = kUFOhciIsoStop,
+       kIsoTxStart = kUFOhciIsoTxStart, kIsoTxStop = kUFOhciIsoTxStop,
+       kIsoStartCont = kUFOhciIsoStartCont, kIsoCompleted = kUFOhciIsoCompleted,
+       kIsoRelease = kUFOhciIsoRelease, kReadCycleTimer = kUFOhciReadCycleTimer,
+       kIsoTxSent = kUFOhciIsoTxSent, kIsoTxRefill = kUFOhciIsoTxRefill, kPump = kUFOhciPump,
+       kIsoTxSetBytes = kUFOhciIsoTxSetBytes, kMidiInEnable = kUFOhciMidiInEnable,
+       kDebugInbound = kUFOhciDebugInbound, kIsoWake = kUFOhciIsoWake };
 
 // OHCI isochronous cycle timer -> linear 24.576 MHz bus ticks. Fields: [31:25] seconds (wraps at 128s),
 // [24:12] cycleCount (0..7999, 8000/s), [11:0] cycleOffset (0..3071, 24.576 MHz). This is the bus clock
@@ -52,8 +68,21 @@ static const uint32_t kTxMemType     = 1;   // must match kUFOhciTxMemoryType
 static const uint32_t kTxSlots       = 640; // must match kUFOhciTxSlots / kITPackets
 static const uint32_t kTxSlotBytes   = 2048;// must match kUFOhciTxSlotBytes
 
+// Transmit pacing. The IT ring self-loops at one packet per isochronous cycle (125 us), so we fill
+// it a fixed distance ahead of the controller's transmit head rather than at our own wake-up rate.
+// The lead must cover the pump's worst-case sleep (1 ms = 8 packets) plus scheduling jitter, and is
+// pure added output latency, so 8 ms is a deliberate compromise. It must stay well under kTxSlots:
+// a lead of kTxSlots means writing the very slot being transmitted.
+static const uint64_t kTxLeadPkts    = 64;  // 8 ms ahead of the transmit head
+static const uint64_t kTxMinLeadPkts = 8;   // 1 ms: below this we have lost the race, resync
+
 static std::atomic<bool> g_run{true};
 static void on_signal(int) { g_run.store(false); }
+
+// The device configuration shadow. Most FF800 registers are write-only, so the host copy is the
+// source of truth and every change rebuilds the whole conf block from it (spec/02 §2.5). Currently
+// only the clock source is reachable from CoreAudio; the rest of the shadow is what uf-set writes.
+static uf::SettingsShadow g_settings{};
 
 // ── dext helpers ──────────────────────────────────────────────────────────────────────────────
 static io_connect_t open_dext() {
@@ -102,10 +131,151 @@ static void fill_tone(uint8_t* txBuf, uint32_t kTxSlots, uint32_t slotBytes,
         }
 }
 
+// Put the pump on the real-time scheduler (THREAD_TIME_CONSTRAINT_POLICY) — the same contract
+// CoreAudio's own IO thread uses. At normal priority the pump is just another thread the kernel may
+// preempt for as long as it likes, and every packet it is late by is a packet of transmit lead we
+// have to carry. This tells the scheduler: over each `period` I need `computation` of CPU, and I am
+// useless if I do not get it within `constraint`.
+//
+// preemptible=0 because a late audio tick is a glitch, not a slowdown. The duty cycle is what keeps
+// that honest: ~0.3 ms of work per 1 ms period, so we are asking for 30% of one core, not a spin.
+// Over-declaring computation is the safer error — a thread that overruns it gets demoted to
+// timeshare for a while, which is exactly the jitter we are buying our way out of. (The UF_TX_WAV
+// diagnostic rewrites the whole ring every tick and will overrun this; that path is not real-time.)
+static void pump_realtime(double periodMs, double computeMs, double constraintMs) {
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    const double ticksPerMs = 1.0e6 * tb.denom / tb.numer;
+    thread_time_constraint_policy_data_t pol;
+    pol.period      = (uint32_t)(periodMs * ticksPerMs);
+    pol.computation = (uint32_t)(computeMs * ticksPerMs);
+    pol.constraint  = (uint32_t)(constraintMs * ticksPerMs);
+    pol.preemptible = 0;
+    thread_port_t self = mach_thread_self();
+    kern_return_t kr = thread_policy_set(self, THREAD_TIME_CONSTRAINT_POLICY,
+                                         (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    mach_port_deallocate(mach_task_self(), self);
+    if (kr == KERN_SUCCESS)
+        std::printf("uf-daemon: pump on the real-time scheduler (%.1f/%.1f/%.1f ms)\n",
+                    periodMs, computeMs, constraintMs);
+    else
+        std::fprintf(stderr, "uf-daemon: real-time scheduling refused (0x%x); pump stays normal-priority\n", kr);
+}
+
+// One pump tick in one IPC: release what we consumed, hand back the tx slots we rewrote, and read
+// both contexts' positions. Every external method is a cross-process call into the dext, so at a
+// 1 kHz tick the difference between this and four separate calls is 3000 round trips a second.
+// The release/refill arguments are last tick's values — a 1 ms deferral against a 64 ms capture ring
+// and an 80 ms transmit lap, which neither cares about.
+static void pump_dext(io_connect_t c, uint64_t releaseUpTo, uint64_t txRefillUpTo,
+                      uint64_t* completed, uint64_t* sent) {
+    uint64_t in[2] = {releaseUpTo, txRefillUpTo};
+    uint64_t out[2] = {0, 0}; uint32_t n = 2;
+    if (IOConnectCallScalarMethod(c, kPump, in, 2, out, &n) == KERN_SUCCESS) {
+        *completed = out[0]; *sent = out[1];
+    }
+}
+
+// ── MIDI ──────────────────────────────────────────────────────────────────────────────────────
+// Two virtual CoreMIDI endpoints, bridged to the FF800's async MIDI registers (spec/04). This lives
+// in the daemon rather than in a separate uf-midi process for a specific reason: every register
+// transaction goes through the dext's single AT context, and two processes each holding their own
+// user client can have their external methods dispatched on different queues — so a MIDI write and
+// an audio-path register write could interleave inside one transaction and corrupt both. One user
+// client, one caller, no interleaving.
+//
+// OUT is real and testable. IN is HARDWARE-GATED: the dext's AR-request receive path has never
+// delivered a packet, so nothing has ever been received.
+static io_connect_t g_conn = 0;
+static MIDIEndpointRef g_midiSrc = 0;   // FF800 -> apps
+
+// Pack MIDI bytes one per little-endian quadlet and block-write them, in <=9-byte transactions
+// paced at the DIN-MIDI rate so we cannot outrun the device's UART (uf::midi_throttle_ns).
+static void midi_send_to_ff800(const uint8_t* bytes, size_t n) {
+    if (!g_conn) return;
+    size_t i = 0;
+    while (i < n) {
+        const size_t chunk = (n - i) < uf::kMidiMaxQuads ? (n - i) : uf::kMidiMaxQuads;
+        std::vector<uint32_t> quads = uf::midi_out_quadlets(bytes + i, chunk);
+        wblock(g_conn, uf::kMidiOutAddr, quads.data(), (uint32_t)quads.size());
+        usleep((useconds_t)(uf::midi_throttle_ns((uint32_t)chunk) / 1000));
+        i += chunk;
+    }
+}
+
+// CoreMIDI calls this on the MIDIServer thread when an app sends to our destination. It is the one
+// place another thread touches the dext; the throttle above means it holds the AT context in short
+// bursts rather than continuously.
+static void midi_read_proc(const MIDIPacketList* pktlist, void*, void*) {
+    const MIDIPacket* p = &pktlist->packet[0];
+    for (unsigned i = 0; i < pktlist->numPackets; ++i) {
+        midi_send_to_ff800(p->data, p->length);
+        p = MIDIPacketNext(p);
+    }
+}
+
+// Drain whatever the device has async-written to our advertised host address and hand it to
+// CoreMIDI. Called from the pump, so it inherits the pump's cadence for free.
+static void midi_poll_in() {
+    if (!g_conn || !g_midiSrc) return;
+    uint64_t out[2] = {0, 0}; uint32_t n = 2;
+    if (IOConnectCallScalarMethod(g_conn, kUFOhciMidiInPoll, nullptr, 0, out, &n) != KERN_SUCCESS)
+        return;
+    const uint32_t count = (uint32_t)out[0];
+    if (count == 0 || count > 8) return;
+    uint8_t bytes[8];
+    for (uint32_t i = 0; i < count; ++i) bytes[i] = (uint8_t)((out[1] >> (8 * i)) & 0xff);
+
+    uint8_t pktbuf[256];
+    MIDIPacketList* pl = reinterpret_cast<MIDIPacketList*>(pktbuf);
+    MIDIPacket* cur = MIDIPacketListInit(pl);
+    cur = MIDIPacketListAdd(pl, sizeof(pktbuf), cur, 0, count, bytes);
+    if (cur) MIDIReceived(g_midiSrc, pl);
+}
+
 static uint64_t scalar0(io_connect_t c, uint32_t sel) {
     uint64_t out = 0; uint32_t n = 1;
     IOConnectCallScalarMethod(c, sel, nullptr, 0, &out, &n);
     return out;
+}
+
+// ── the interrupt-driven wake ─────────────────────────────────────────────────────────────────
+// The dext raises the OHCI isochronous receive completion interrupt every kUFOhciIrqEvery captured
+// packets and signals this port. That is the FF800's own packet cadence, so the pump now runs on the
+// device's clock instead of a host timer that drifts against it — the difference between feeding a
+// small CoreAudio buffer reliably under DAW load and not.
+//
+// The message is only an edge: everything the tick needs is in the status page the interrupt handler
+// fills, so there is no async payload to decode on the realtime thread. We only have to receive and
+// discard, which is also why this can be a bare mach_msg rather than a runloop — a CFRunLoop on the
+// pump thread would be its own source of latency.
+static bool wake_wait(mach_port_t port, uint32_t timeoutMs) {
+    struct { mach_msg_header_t hdr; uint8_t body[512]; } msg;
+    kern_return_t kr = mach_msg(&msg.hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                                sizeof(msg), port, timeoutMs, MACH_PORT_NULL);
+    if (kr != MACH_MSG_SUCCESS && kr != MACH_RCV_TOO_LARGE) return false;
+    // Coalesce anything already queued behind it. If we ever fall a few interrupts behind, waking
+    // once per backlogged message would have us doing empty ticks to catch up instead of one full
+    // one — and the backlog is exactly when we can least afford the waste.
+    while (mach_msg(&msg.hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                    sizeof(msg), port, 0, MACH_PORT_NULL) == MACH_MSG_SUCCESS) {}
+    return true;
+}
+
+// A coherent read of the dext's status page (seqlock; the interrupt handler is the only writer).
+static bool status_read(const volatile struct UFOhciStatus* s, struct UFOhciStatus* out) {
+    for (int retry = 0; retry < 4; ++retry) {
+        const uint64_t s0 = s->seq;
+        if (s0 & 1) continue;                       // write in progress
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        out->irqCount    = s->irqCount;
+        out->rxCompleted = s->rxCompleted;
+        out->txSent      = s->txSent;
+        out->hostTime    = s->hostTime;
+        out->cycleTimer  = s->cycleTimer;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (s->seq == s0) return s0 != 0;           // seq 0 = the interrupt has never fired
+    }
+    return false;
 }
 
 // ── a shared-memory ring, created + owned by the daemon ─────────────────────────────────────────
@@ -122,19 +292,55 @@ static uf::shm::Ring* make_ring(const char* name) {
     return r;
 }
 
-int main() {
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
+// ── the streaming session ─────────────────────────────────────────────────────────────────────
+// Everything from claiming the device to the device fetching PCM, plus the packet geometry that
+// follows from the rate. Factored out of main() because it now has three callers, not one: initial
+// bring-up, a rate change requested by CoreAudio, and wedge recovery. Those last two are the same
+// operation — stop the session, start it again — which is exactly why this is a function.
+struct Session {
+    uint32_t rate;
+    uf::Speed speed;
+    uint32_t dbq;             // data-block quadlets = PCM channels at this speed class
+    uint32_t rx_channel;      // the iso channel WE transmit playback on
+    uint32_t dbqFlag;
+    uint32_t tx_channel;      // the iso channel the DEVICE transmits capture on
+    uint32_t sytInterval;     // frames per full transmit packet
+    uint32_t fullPayload;     // bytes per full transmit packet
+    uint32_t fullCount;       // full packets per ring lap (the blocking cadence)
+};
 
-    io_connect_t conn = open_dext();
-    if (!conn) { std::fprintf(stderr, "uf-daemon: dext not available\n"); return 1; }
+static void session_stop(io_connect_t conn, const Session& s) {
+    // Fetch off first so the device stops pulling PCM, then the DMA contexts, then the device-side
+    // comm-stop. Stopping DMA before the device stop-write is the order the device requires.
+    { std::vector<uint32_t> ones(s.dbq, 1); wblock(conn, uf::reg::kStatus0, ones.data(), s.dbq); }
+    IOConnectCallScalarMethod(conn, kIsoStop, nullptr, 0, nullptr, nullptr);
+    IOConnectCallScalarMethod(conn, kIsoTxStop, nullptr, 0, nullptr, nullptr);
+    { const uint32_t blob[3] = {0u, 0u, 0u}; wblock(conn, uf::reg::kInitBankStop, blob, 3); }
+}
 
-    // Session parameters. 48 kHz, 28 channels — the plugin declares the same.
-    const uint32_t rate = 48000;
-    const uf::Speed speed = uf::speed_for_rate(rate);
-    const uint32_t dbq = uf::data_block_quadlets(speed);
-    const uint32_t rx_channel = 1;
-    const uint32_t dbqFlag = dbq | 0x800u;   // S800 double-speed flag rides with dbq
+static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
+    if (!uf::is_supported_rate(rate)) {
+        std::fprintf(stderr, "uf-daemon: unsupported rate %u\n", rate);
+        return false;
+    }
+    Session s = {};
+    s.rate       = rate;
+    s.speed      = uf::speed_for_rate(rate);
+    s.dbq        = uf::data_block_quadlets(s.speed);
+    s.rx_channel = 1;
+    s.dbqFlag    = s.dbq | 0x800u;   // S800 double-speed flag rides with dbq
+    const uint32_t dbq = s.dbq, rx_channel = s.rx_channel, dbqFlag = s.dbqFlag;
+    const uf::Speed speed = s.speed;
+
+    // UF_STEP_PAUSE=<sec> pauses after each setup step, so a human can see which write changes the
+    // front-panel HOST LED (red at power-on -> off -> ?).
+    auto step_pause = [&](const char* label) {
+        if (const char* sp = getenv("UF_STEP_PAUSE")) {
+            std::printf(">>> STEP: %s — WATCH THE LED (%ss)\n", label, sp);
+            std::fflush(stdout);
+            usleep((useconds_t)(atof(sp) * 1e6));
+        }
+    };
 
     // [0] CLAIM THE DEVICE FIRST. The host-LED register is written before the rate and before any
     // stream op, unconditionally, on attach and every bus reset. An unclaimed FF800 runs
@@ -143,14 +349,17 @@ int main() {
     // write this LAST, after fetch-enable.
     wq(conn, uf::reg::kHostLed, 0);
     usleep(20 * 1000);
+    step_pause("0: hostLED 0x324<-0 (claim)");
 
-    // Lock the device to INTERNAL MASTER clock at `rate` first. Without this it sits in autosync with
-    // nothing locked and free-runs (observed: 64 kHz / 8000 full packets/s), so the stream rate is
-    // wrong. The default SettingsShadow is internal-master; the conf block carries the clock mode.
-    { uf::ConfBlock cb = uf::assemble_conf_block(uf::SettingsShadow{});
+    // Lock the device to the configured clock source at `rate` first. Without this it sits in
+    // autosync with nothing locked and free-runs (observed: 64 kHz / 8000 full packets/s), so the
+    // stream rate is wrong. The conf block carries the clock mode; g_settings defaults to internal
+    // master and is what the control plane edits.
+    { uf::ConfBlock cb = uf::assemble_conf_block(g_settings);
       const uint32_t conf[3] = {cb.cr0, cb.cr1, cb.cr2};
       wblock(conn, uf::reg::kConfBlock, conf, 3); }
     usleep(20 * 1000);
+    step_pause("conf block 0xfc88f014 (internal master)");
 
     // 0x801c0000 = FORMER_REG_FETCH_PCM_FRAMES (snd-fireface). 0 per channel = FETCH (play) that
     // channel, 1 = don't fetch. Critically, snd-fireface enables fetch (writes 0) only AFTER the iso
@@ -160,6 +369,7 @@ int main() {
     { std::vector<uint32_t> ones(dbq, 1);
       wblock(conn, uf::reg::kStatus0, ones.data(), dbq);
       std::printf("uf-daemon: [1] fetch DISABLED (0x801c0000 <- 1) during setup\n"); }
+    step_pause("1: fetch disabled 0x801c0000<-1");
 
     // 0x801c0080 = OUTPUT_REC_MASK (FFADO set_hardware_output_rec writes 28 quads of (rec!=0); the
     // factory driver writes the same 28-quadlet block). We have NEVER written this. It is the one
@@ -187,17 +397,28 @@ int main() {
     // Session up on the 0x0002 bank. The tested FF800 firmware treats the fc88f STF as dead code and
     // uses this bank. init[1] = (dbq<<11)|rx_channel IS the rx-packet-format (playback-arm) value;
     // init[0]=rate, init[2]=dbq|s800flag.
+    // UF_RATE_LATCH: standalone single-quad rate latch to 0x2_0000001c BEFORE the 3-quad init,
+    // which the factory driver always does and we skip.
+    if (getenv("UF_RATE_LATCH")) { wq(conn, uf::reg::kInitBankStream, rate);
+        std::printf("uf-daemon: [LED6] standalone rate latch 0x2_0000001c <- %u\n", rate); }
+    // UF_MIDI_HOST: register a host async-receive address at 0x2_00000320 (snd-fireface does this
+    // at probe + every reset; we never do). MidiInEnable writes (localNodeId<<16)|highIndex there.
+    if (getenv("UF_MIDI_HOST")) { uint64_t a = 0x11; IOConnectCallScalarMethod(conn, kMidiInEnable, &a, 1, nullptr, nullptr);
+        std::printf("uf-daemon: [LED2] host address registered at 0x2_00000320 (MidiInEnable)\n"); }
     { const uint32_t init[3] = {rate, (dbq << 11) | rx_channel, dbqFlag};
       wblock(conn, uf::reg::kInitBankStream, init, 3); }
     usleep(100 * 1000);
+    step_pause("init 0x2_0000001c 3-quad");
 
     uint32_t tx_channel = 0xffffffff;
     for (int i = 0; i < 100 && tx_channel == 0xffffffff; ++i) {
         if (!rq(conn, uf::reg::kTxIsoChannel, &tx_channel)) break;
         if (tx_channel == 0xffffffff) usleep(20 * 1000);
     }
-    if (tx_channel == 0xffffffff) { std::fprintf(stderr, "uf-daemon: no tx channel\n"); return 1; }
+    if (tx_channel == 0xffffffff) { std::fprintf(stderr, "uf-daemon: no tx channel\n"); return false; }
+    s.tx_channel = tx_channel;
     std::printf("uf-daemon: STF+RxFormat+AllocTx done, device tx ch=%u\n", tx_channel);
+    step_pause("tx channel published");
 
     // Continuous capture + a blocking transmit stream, then open the session and fetch PCM. Blocking
     // (ref/snd-fireface): full packets carry syt_interval frames; fullPerFour full packets per 4 hit
@@ -246,6 +467,7 @@ int main() {
     wq(conn, uf::reg::kInitBankStart, 0x80000000u | dbqFlag);   // 0x0002 bank comm-start
     std::printf("uf-daemon: [3] comm-start (fc88f00c)\n");
     usleep(5 * 1000);
+    step_pause("3: comm-start 0x2_00000028");
 
     // [4] iso start AFTER comm-start: capture context on the device-published channel, then our
     // transmit on rx_channel (the device now listening for playback there).
@@ -255,6 +477,7 @@ int main() {
         IOConnectCallScalarMethod(conn, kIsoTxStart, a, 3, nullptr, nullptr);
     } else std::printf("uf-daemon: [4] TRANSMIT SKIPPED (UF_NO_TX)\n");
     std::printf("uf-daemon: [4] iso started\n");
+    step_pause("4: iso streams started");
 
     // [5] ENABLE fetch LAST — snd-fireface enables fetch only after the iso streams are up and running
     // (snd_ff_stream_start_duplex → switch_fetching_mode(true)). Give the streams a moment to settle so
@@ -265,8 +488,31 @@ int main() {
         std::vector<uint32_t> mask(dbq, v);
         wblock(conn, uf::reg::kStatus0, mask.data(), dbq);
         std::printf("uf-daemon: [5] fetch ENABLED (0x801c0000 <- %u) after streams settled\n", v);
+        step_pause("5: fetch ENABLED 0x801c0000<-0 (device fetches host PCM) — GREEN?");
     }
 
+    s.sytInterval = sytInterval;
+    s.fullPayload = fullPayload;
+    s.fullCount   = fullCount;
+    *out = s;
+    std::printf("uf-daemon: session up at %u Hz (%u ch, %u frames/pkt)\n", rate, dbq, sytInterval);
+    return true;
+}
+
+int main() {
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+
+    io_connect_t conn = open_dext();
+    if (!conn) { std::fprintf(stderr, "uf-daemon: dext not available\n"); return 1; }
+    g_conn = conn;
+
+    // Rate via UF_RATE (default 48 kHz); CoreAudio can change it later through the shm ring.
+    const uint32_t startRate = getenv("UF_RATE") ? (uint32_t)atoi(getenv("UF_RATE")) : 48000;
+    Session ses = {};
+    if (!session_start(conn, startRate, &ses)) return 1;
+    uint32_t rate = ses.rate, dbq = ses.dbq, rx_channel = ses.rx_channel;
+    uint32_t sytInterval = ses.sytInterval, fullPayload = ses.fullPayload, fullCount = ses.fullCount;
 
     // Map the dext's capture buffer (packets land here, 2 prefix quadlets + payload per slot).
     mach_vm_address_t dextAddr = 0; mach_vm_size_t dextSize = 0;
@@ -285,10 +531,91 @@ int main() {
     uint8_t* txBuf = reinterpret_cast<uint8_t*>(txAddr);
     std::memset(txBuf, 0, txSize);   // idle = true silence; else the FF800 plays stale DMA garbage
 
+    // Map the dext's interrupt status page and subscribe to the isochronous completion interrupt.
+    // Both are optional: if either fails we fall back to the 1 ms polled pump, which is what this
+    // daemon did before there was an interrupt to block on. UF_NO_IRQ forces that path for A/B.
+    const volatile struct UFOhciStatus* devStatus = nullptr;
+    struct UFOhciControl* devControl = nullptr;
+    mach_port_t wakePort = MACH_PORT_NULL;
+    IONotificationPortRef notifyPort = nullptr;
+    if (!getenv("UF_NO_IRQ")) {
+        mach_vm_address_t stAddr = 0; mach_vm_size_t stSize = 0;
+        if (IOConnectMapMemory64(conn, kUFOhciStatusMemoryType, mach_task_self(), &stAddr, &stSize,
+                                 kIOMapAnywhere) == KERN_SUCCESS) {
+            devStatus  = reinterpret_cast<const volatile struct UFOhciStatus*>(stAddr);
+            devControl = reinterpret_cast<struct UFOhciControl*>(stAddr + kUFOhciControlOffset);
+            notifyPort = IONotificationPortCreate(kIOMainPortDefault);
+            wakePort = IONotificationPortGetMachPort(notifyPort);
+            uint64_t ref[1] = {0};
+            uint32_t outCnt = 0;
+            kern_return_t kr = IOConnectCallAsyncScalarMethod(conn, kIsoWake, wakePort, ref, 1,
+                                                              nullptr, 0, nullptr, &outCnt);
+            if (kr != KERN_SUCCESS) {
+                std::fprintf(stderr, "uf-daemon: iso wake subscribe failed (0x%x); polling\n", kr);
+                wakePort = MACH_PORT_NULL;
+            } else {
+                std::printf("uf-daemon: pump is interrupt-driven (irq every %u packets)\n",
+                            kUFOhciIrqEvery);
+            }
+        } else {
+            std::fprintf(stderr, "uf-daemon: no dext status page; polling\n");
+        }
+    }
+    const bool irqPump = wakePort != MACH_PORT_NULL && devStatus != nullptr;
+
+    // The pump wants a 1 ms tick it actually hits: real-time scheduling for the priority, an absolute
+    // deadline for the period. Both are gated so they can be A/B'd against the old behaviour.
+    if (!getenv("UF_NO_RT")) pump_realtime(1.0, 0.3, 0.7);
+    mach_timebase_info_data_t ptb; mach_timebase_info(&ptb);
+    const uint64_t kPumpPeriodTicks = (uint64_t)(1.0e6 * ptb.denom / ptb.numer);   // 1 ms in mach ticks
+    uint64_t deadline = mach_absolute_time(), pumpLate = 0, wakeTimeouts = 0;
+
     uf::shm::Ring* cap = make_ring(uf::shm::kCaptureName);
     uf::shm::Ring* play = make_ring(uf::shm::kPlaybackName);
     if (!cap || !play) return 1;
-    std::printf("uf-daemon: streaming (tx ch %u), rings up. Ctrl-C to stop.\n", tx_channel);
+    // Tell the plugin what is actually on the wire. Until this is set it advertises nothing, so
+    // CoreAudio cannot select a rate we are not at.
+    cap->deviceRate.store(rate, std::memory_order_release);
+
+    // MIDI endpoints. Created after the session is up so they only appear alongside a device that
+    // can actually carry their traffic. UF_NO_MIDI skips them entirely.
+    MIDIClientRef midiClient = 0;
+    MIDIEndpointRef midiDest = 0;
+    if (!getenv("UF_NO_MIDI")) {
+        MIDIClientCreate(CFSTR("UserFace800"), nullptr, nullptr, &midiClient);
+        MIDIDestinationCreate(midiClient, CFSTR("Fireface 800 MIDI Out"), midi_read_proc, nullptr,
+                              &midiDest);
+        MIDISourceCreate(midiClient, CFSTR("Fireface 800 MIDI In"), &g_midiSrc);
+        // Advertise a host receive address so the device async-writes incoming MIDI to us. High
+        // index 1 puts it at 0x1_00000000 — the first middle-address-space address, above the
+        // physical-DMA range, so the writes land in the AR-request context rather than being DMA'd
+        // straight into host memory (the same convention Linux's firewire core uses).
+        uint64_t hi = 1;
+        IOConnectCallScalarMethod(conn, kMidiInEnable, &hi, 1, nullptr, nullptr);
+        std::printf("uf-daemon: MIDI endpoints up (out real; in hardware-gated)\n");
+    }
+    std::printf("uf-daemon: streaming (tx ch %u), rings up. Ctrl-C to stop.\n", ses.tx_channel);
+
+    // LED probe: with a fully-established session up, apply a register write and watch the
+    // front-panel HOST LED. UF_PROBE_ADDR=<48-bit hex>, UF_PROBE_VAL=<hex> (default 0). Applied once
+    // here; UF_PROBE_PERIODIC re-asserts it each second in the pump. Selecting the address from the
+    // environment means a different one needs no rebuild.
+    // UF_RECLAIM_S: the factory driver re-asserts the WHOLE claim on every bus reset while streams
+    // are up, which a claim written before the streams exist does not reproduce. Re-issue the full
+    // claim once, UF_RECLAIM_S seconds after streams are locked.
+    const double reclaimAt = getenv("UF_RECLAIM_S") ? atof(getenv("UF_RECLAIM_S")) : -1.0;
+    bool reclaimed = false;
+    const bool probePeriodic = getenv("UF_PROBE_PERIODIC");
+    uint64_t probeAddr = 0; uint32_t probeVal = 0; bool probeOn = false;
+    if (const char* pa = getenv("UF_PROBE_ADDR")) {
+        probeAddr = strtoull(pa, nullptr, 16);
+        probeVal = getenv("UF_PROBE_VAL") ? (uint32_t)strtoul(getenv("UF_PROBE_VAL"), nullptr, 16) : 0;
+        probeOn = true;
+        bool ok = wq(conn, probeAddr, probeVal);
+        std::printf("uf-daemon: LED PROBE write 0x%llx <- 0x%08x -> %s\n",
+                    (unsigned long long)probeAddr, probeVal, ok ? "ok" : "FAILED");
+        std::fflush(stdout);
+    }
 
     // ── the pump ────────────────────────────────────────────────────────────────────────────────
     // Capture: read newly-completed dext packets, decode each into an shm slot's frames. We pack one
@@ -303,7 +630,10 @@ int main() {
     std::vector<int32_t> frame(dbq);
     uint64_t ticks = 0, lastConsumed = 0, lastFrames = 0;
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
-    uint64_t rt0 = mach_absolute_time(), rf0 = 0, rc0 = 0;
+    // Host clock ticks per audio frame — used to back-date the clock anchor onto the period boundary
+    // it belongs to (see the publish below).
+    double hostTicksPerFrame = 1.0e9 / (double)rate * (double)tb.denom / (double)tb.numer;
+    uint64_t rt0 = mach_absolute_time(), rf0 = 0, rc0 = 0, tx0 = 0, irq0 = 0;
     uint64_t toneStart = mach_absolute_time(); int toneCh = -1;   // UF_TX_TONE per-channel sweep
     std::vector<int32_t> wavSamps; uint64_t wavFrames = 0;        // UF_TX_WAV=<raw s32le stereo 48k>
     if (const char* wp = getenv("UF_TX_WAV")) {
@@ -316,7 +646,98 @@ int main() {
     }
     uint64_t ct0 = cycle_timer_ticks((uint32_t)scalar0(conn, kReadCycleTimer));   // bus-clock anchor
     uint64_t nFull = 0, nEmpty = 0, nOther = 0, nDupTs = 0; uint32_t lastTs = 0xffffffff;
+    // Cycle-time continuity. A gap means the controller missed isochronous cycles, so capture has a
+    // hole and the frame counts after it no longer describe the device's real position.
+    uint32_t lastCycle = 0, worstGap = 0; bool haveCycle = false;
+    uint64_t cycleGaps = 0, missedCycles = 0, cycleRestarts = 0;
+    // Self-arming state for the restart above. UF_CYCLE_RESTART=0 forces it off entirely; =1 arms it
+    // immediately, skipping the proving window (for testing the restart path itself).
+    bool cycleArmed = getenv("UF_CYCLE_RESTART") && atoi(getenv("UF_CYCLE_RESTART")) == 1;
+    bool cycleDisarmed = getenv("UF_CYCLE_RESTART") && atoi(getenv("UF_CYCLE_RESTART")) == 0;
+    uint64_t lastCycleRestart = 0, cycleRestartBurst = 0;
+    const double kCycleArmSec = 10.0;           // clean streaming needed before we believe the premise
+    const double kCycleRestartFloorSec = 30.0;  // restarts closer together than this look like flapping
+    // How big a gap to treat as a broken stream rather than a blip. One cycle is 125 us; 8 is a
+    // millisecond of missing capture, which is already past anything the ring depth hides.
+    const uint32_t kCycleGapRestart =
+        getenv("UF_CYCLE_GAP") ? (uint32_t)atoi(getenv("UF_CYCLE_GAP")) : 8;
+    // Transmit pacing state. txFillPkt is the monotonic packet index we have filled up to and mirrors
+    // the dext's itFillCursor; it starts one lap ahead because IsoTxStart leaves the whole ring
+    // populated with silence. ps/psPos thread a frame cursor through the plugin's fixed-size slots.
+    uint64_t txFillPkt = kTxSlots, txResyncs = 0, txDry = 0, txLastSent = 0;
+    const uf::shm::Slot* ps = nullptr; uint32_t psPos = 0;
+    const bool txFreeRun = getenv("UF_TX_FREERUN") != nullptr;   // A/B against the old free-running fill
+    const bool txPaced   = !txFreeRun && !getenv("UF_NO_TX");
+    // Clock servo. The FF800 fetches playback at its own crystal (~48002), we deliver a base 48000
+    // (sytInterval frames every bus cycle); the deficit drains its playback FIFO (SR0 bit 19 latches
+    // ~26 s in). The servo sprinkles occasional (sytInterval+1)-frame packets so the long-term average
+    // tracks the measured device rate. servoAccum carries the fractional frame debt across packets.
+    const bool servoOn   = txPaced && !getenv("UF_NO_SERVO");
+    double servoAccum = 0.0;
+    bool servoReady = false;                          // a valid (non-startup) rate sample has arrived
+    double measuredRate = (double)rate;               // device frames/bus-s, updated once per second
+    double baseRate = (double)(8000u * sytInterval);   // what an all-sytInterval cadence delivers
+    std::vector<uint32_t> slotBytes(kTxSlots, fullPayload);  // payload currently programmed per slot
+    // UF_TX_PACED_TONE=<ch>: synthesise a phase-continuous tone straight into the paced+servo path, so
+    // the servo can be tested from the daemon alone (the static UF_TX_TONE ring cannot be servoed).
+    const int pacedToneCh = getenv("UF_TX_PACED_TONE") ? atoi(getenv("UF_TX_PACED_TONE")) : -1;
+    const double pacedToneFreq = getenv("UF_TX_FREQ") ? atof(getenv("UF_TX_FREQ")) : 437.0;
+    double pacedTonePhase = 0.0;
+    const double pacedTonePhaseInc = 2.0 * M_PI * pacedToneFreq / (double)rate;
     uint64_t txCursor = 0; uint32_t txFill = 0; uint8_t* txSlotPtr = txBuf;
+    uint64_t playMinDepth = ~0ull;   // shallowest the playback ring got this second
+    uint64_t lastProgress = mach_absolute_time();   // when capture last advanced (wedge detection)
+    uint64_t lastConsumedForWedge = 0, wedgeRestarts = 0, restarts = 0;
+    uint64_t seenRequest = cap->requestSeq.load(std::memory_order_acquire);
+    uint64_t seenControl = cap->controlSeq.load(std::memory_order_acquire);
+    // How long capture may stall before we call it a wedge. Comfortably longer than any scheduling
+    // hiccup (the pump ticks at 1 kHz) and far shorter than a human noticing the audio has died.
+    const double kWedgeMs = getenv("UF_WEDGE_MS") ? atof(getenv("UF_WEDGE_MS")) : 500.0;
+
+    // Tear the session down and bring it back up, at `newRate`. Used for a CoreAudio rate change and
+    // for wedge recovery — the same operation, which is why they share this.
+    //
+    // deviceFrames deliberately does NOT reset. It is the sample position CoreAudio's timeline is
+    // built on, and rewinding it would hand the plugin a backwards jump; carrying it across the seam
+    // just means the clock's slope changes, which is what a rate change IS. Everything tied to the
+    // dext's cursors does reset, because IsoStartContinuous/IsoTxStart rewind those to zero.
+    auto restart_session = [&](uint32_t newRate, const char* why) -> bool {
+        std::printf("uf-daemon: RESTART (%s) -> %u Hz\n", why, newRate);
+        std::fflush(stdout);
+        cap->deviceRate.store(0, std::memory_order_release);   // "nothing on the wire" while we switch
+        // Drop our cursors before the contexts restart. They are monotonic counts into the OLD
+        // session, and IsoStartContinuous/IsoTxStart rewind the dext's to zero — an interrupt landing
+        // in between would apply a cursor from the previous run and release packets the new session
+        // has only just captured.
+        if (devControl) { devControl->releaseUpTo = 0; devControl->txFillUpTo = 0; }
+        session_stop(conn, ses);
+        Session next = {};
+        if (!session_start(conn, newRate, &next)) {
+            std::fprintf(stderr, "uf-daemon: restart FAILED at %u Hz\n", newRate);
+            return false;
+        }
+        ses = next;
+        rate = ses.rate; dbq = ses.dbq; rx_channel = ses.rx_channel;
+        sytInterval = ses.sytInterval; fullPayload = ses.fullPayload; fullCount = ses.fullCount;
+
+        consumed = 0;                       // the dext rewound both context cursors
+        lastConsumed = 0;                   // else the per-second delta underflows into nonsense
+        capSlot = nullptr; capFill = 0;
+        txFillPkt = kTxSlots; txLastSent = 0; txCursor = 0; txFill = 0; txSlotPtr = txBuf;
+        ps = nullptr; psPos = 0;
+        frame.assign(dbq, 0);
+        slotBytes.assign(kTxSlots, fullPayload);
+        std::memset(txBuf, 0, txSize);      // stale PCM at the old geometry is noise at the new one
+        servoAccum = 0.0; servoReady = false; measuredRate = (double)rate;
+        baseRate = (double)(8000u * sytInterval);
+        hostTicksPerFrame = 1.0e9 / (double)rate * (double)tb.denom / (double)tb.numer;
+        rt0 = mach_absolute_time(); rf0 = deviceFrames; rc0 = 0; tx0 = 0;
+        ct0 = cycle_timer_ticks((uint32_t)scalar0(conn, kReadCycleTimer));
+        lastProgress = mach_absolute_time();
+        ++restarts;
+        cap->deviceRate.store(rate, std::memory_order_release);
+        return true;
+    };
 
     while (g_run.load()) {
         // Per second: the FF800 frame rate measured two ways — against the CPU clock (mach) and against
@@ -333,14 +754,102 @@ int main() {
                 if (ct < ct0) dct = ct + 128ull * 8000ull * 3072ull - ct0;   // seconds field wrapped
                 double busSec = double(dct) / (double)kCycleTimerTicksPerSec;
                 double fVsBus = busSec > 0 ? (deviceFrames - rf0) / busSec : 0;
-                std::printf("  REAL: %.0f frames/s (mach)  %.1f frames/bus-s  bus8k=%.2f Hz  %.0f pkt/s  ring=%llu over=%u under=%u\n",
+                // Servo target = the device's true rate. Reject the startup-ramp transient (~51300 in
+                // second 1) with a TIGHT band — a single bad sample fed to the servo overshoots the
+                // FIFO the other way — then low-pass, because the per-second frame count is noisy at
+                // ~+/-8 frames (quantisation) while the signal we track is only ~2 frames/s.
+                if (fVsBus > baseRate - 60 && fVsBus < baseRate + 60) {
+                    measuredRate = servoReady ? 0.8 * measuredRate + 0.2 * fVsBus : fVsBus;
+                    servoReady = true;
+                }
+                // pumpLate = ticks whose work overran the 1 ms period, so the deadline had to be
+                // resynced instead of chasing a backlog. Non-zero means the pump is not keeping up.
+                std::printf("  REAL: %.0f frames/s (mach)  %.1f frames/bus-s  bus8k=%.2f Hz  %.0f pkt/s  ring=%llu over=%u under=%u late=%llu\n",
                             (deviceFrames - rf0) / el, fVsBus, dct / busSec / 3072.0,
                             (consumed - rc0) / el,
-                            (unsigned long long)cap->depth(), cap->overruns.load(), cap->underruns.load());
+                            (unsigned long long)cap->depth(), cap->overruns.load(), cap->underruns.load(),
+                            (unsigned long long)pumpLate);
+                // Interrupt health. irq/s should sit at 8000/kUFOhciIrqEvery (1000/s at the default);
+                // a climbing timeout count means the completion interrupt stopped arriving, which is
+                // the wedge signature seen from this side.
+                if (irqPump) {
+                    struct UFOhciStatus st = {};
+                    const bool ok = status_read(devStatus, &st);
+                    std::printf("  IRQ: %.0f irq/s (total %llu)  timeouts=%llu  live=%d\n",
+                                ok ? (double)(st.irqCount - irq0) / el : 0.0,
+                                (unsigned long long)(ok ? st.irqCount : 0),
+                                (unsigned long long)wakeTimeouts, ok ? 1 : 0);
+                    irq0 = ok ? st.irqCount : irq0;
+                }
+                // Transmit pacing health. sent should climb at 8000 pkt/s (one per isoch cycle) and
+                // lead should sit at kTxLeadPkts; a non-zero resync count means the fill loop lost
+                // the race with the transmit head, which is exactly what tears the playback audio.
+                // The playback ring's own counters separate a host/device clock-rate mismatch from
+                // a pacing fault: a ~42 ppm mismatch takes ~32 MINUTES to walk the 3840-frame tx
+                // ring, so a mismatch large enough to matter on a shorter period shows up here as
+                // the playback ring steadily filling (over=) or draining (dry=).
+                // The playback ring's MINIMUM depth over the second is what sizes the safety offset.
+                // `under=` only tells you the cushion was too small (it already glitched); the
+                // minimum tells you how much margin was actually left, so one run gives the number
+                // for UF_SAFETY_OFFSET_MS directly. Depth is in slots; each slot is
+                // kFramesPerSlot frames, so a minimum of N slots means roughly N x (512/rate) of
+                // margin — trim the offset toward zero margin, never past it.
+                std::printf("  MARGIN: play ring min=%llu slots = %.1f ms spare (under=%u)\n",
+                            (unsigned long long)playMinDepth,
+                            (double)playMinDepth * uf::shm::kFramesPerSlot * 1000.0 / rate,
+                            play->underruns.load());
+                playMinDepth = ~0ull;
+                if (!txFreeRun && !getenv("UF_NO_TX"))
+                    std::printf("  TX: %.0f pkt/s  lead=%lld pkt  resync=%llu dry=%llu  "
+                                "play ring=%llu over=%u under=%u  servo=%d rate=%.1f acc=%+.2f\n",
+                                (txLastSent - tx0) / el, (long long)(txFillPkt - txLastSent),
+                                (unsigned long long)txResyncs, (unsigned long long)txDry,
+                                (unsigned long long)play->depth(), play->overruns.load(),
+                                play->underruns.load(), servoOn ? 1 : 0, measuredRate, servoAccum);
+                // Live device status — the FF800's own view of its clock. We are hunting the "host
+                // locked" (green LED) state, so dump raw SR0/SR1 (undecoded bits included) plus the
+                // decoded master/sync/rate, and watch it across the ~20 s settling transient.
+                uint32_t sr0v = 0, sr1v = 0;
+                rq(conn, uf::reg::kStatus0, &sr0v);
+                rq(conn, uf::reg::kClockConfig, &sr1v);
+                uf::UFStatus st = uf::decode_status(sr0v, sr1v);
+                // Publish what the device says is driving it, which is not necessarily what was
+                // asked for: an external clock can disappear and leave the FF800 back on its own
+                // crystal. CoreAudio should show the truth — that is the whole point of looking at
+                // the clock-source menu when something sounds wrong.
+                {
+                    const auto active = uf::ctl::clock_source_from_status(st.clock_master, st.sync_source);
+                    cap->clockSource.store((uint32_t)active, std::memory_order_release);
+                    const bool locked =
+                        st.clock_master ||
+                        (active == uf::ctl::ClockSource::Adat1     && st.adat1_lock && st.adat1_sync) ||
+                        (active == uf::ctl::ClockSource::Adat2     && st.adat2_lock && st.adat2_sync) ||
+                        (active == uf::ctl::ClockSource::Spdif     && st.spdif_lock && st.spdif_sync) ||
+                        (active == uf::ctl::ClockSource::WordClock && st.wclk_lock  && st.wclk_sync) ||
+                        (active == uf::ctl::ClockSource::Tco       && st.tco_lock   && st.tco_sync);
+                    cap->clockLocked.store(locked ? 1u : 0u, std::memory_order_release);
+                }
+                double upSec = double(now - toneStart) * tb.numer / tb.denom / 1e9;
+                std::printf("  STATUS @%5.1fs: SR0=%08x SR1=%08x  bit31=%d bit11=%d  master=%d\n",
+                            upSec, sr0v, sr1v, (sr0v >> 31) & 1, (sr0v >> 11) & 1, st.clock_master);
+                IOConnectCallScalarMethod(conn, kDebugInbound, nullptr, 0, nullptr, nullptr);  // log FF800->host probes
+                if (probeOn && probePeriodic) wq(conn, probeAddr, probeVal);   // re-assert candidate each second
+                if (reclaimAt >= 0 && !reclaimed && upSec >= reclaimAt) {       // LED1: re-claim while locked
+                    reclaimed = true;
+                    wq(conn, uf::reg::kHostLed, 0);
+                    const uint32_t init[3] = {rate, (dbq << 11) | rx_channel, ses.dbqFlag};
+                    wblock(conn, uf::reg::kInitBankStream, init, 3);
+                    wq(conn, uf::reg::kInitBankStart, 0x80000000u | ses.dbqFlag);
+                    std::printf("uf-daemon: [LED1] re-asserted full claim at %.1fs (streams locked) — WATCH THE LED\n", upSec);
+                }
                 std::fflush(stdout);
-                rt0 = now; rf0 = deviceFrames; rc0 = consumed; ct0 = ct;
+                rt0 = now; rf0 = deviceFrames; rc0 = consumed; ct0 = ct; tx0 = txLastSent;
             }
         }
+        // MIDI in. One cheap external method per tick; at 31250 baud the device can produce at most
+        // ~3 bytes in a millisecond, well inside the 8 a poll returns.
+        if (g_midiSrc) midi_poll_in();
+
         if (++ticks % 1000 == 0) {
             std::printf("  cap: %llu pkt (+%llu/s)  frames=%llu (+%llu/s)  ring=%llu over=%u under=%u\n",
                         (unsigned long long)consumed, (unsigned long long)(consumed - lastConsumed),
@@ -350,16 +859,110 @@ int main() {
             std::printf("       lengths: full=%llu empty=%llu other=%llu  dup-timestamps=%llu\n",
                         (unsigned long long)nFull, (unsigned long long)nEmpty, (unsigned long long)nOther,
                         (unsigned long long)nDupTs);
+            // Cycle continuity. gaps=0 is the healthy state: every packet lands exactly one
+            // isochronous cycle after the last. Anything else is capture with holes in it, and
+            // `missed` counts how many cycles' worth of frames the timeline never saw.
+            std::printf("       cycles: gaps=%llu missed=%llu restarts=%llu\n",
+                        (unsigned long long)cycleGaps, (unsigned long long)missedCycles,
+                        (unsigned long long)cycleRestarts);
             std::fflush(stdout);
             lastConsumed = consumed; lastFrames = deviceFrames;
         }
-        const uint64_t total = scalar0(conn, kIsoCompleted);
+        // The tick's single dext round trip. Release/refill carry last tick's cursors; the returned
+        // positions drive this tick's capture drain and playback fill.
+        // Where the controller is, and where we are. On the interrupt path both directions travel
+        // through the shared page — the dext's cursors come from the snapshot the interrupt handler
+        // published, and ours go back in the control block for the next interrupt to apply — so the
+        // steady-state tick makes NO external method call at all. The polled fallback still does its
+        // one round trip, and so does the interrupt path until the first interrupt has landed.
+        struct UFOhciStatus snap = {};
+        const bool haveSnap = irqPump && status_read(devStatus, &snap);
+        uint64_t total = consumed, sent = txLastSent;
+        if (haveSnap) {
+            total = snap.rxCompleted;
+            sent  = snap.txSent;
+            devControl->releaseUpTo = consumed;
+            devControl->txFillUpTo  = txPaced ? txFillPkt : 0;
+        } else {
+            pump_dext(conn, consumed, txPaced ? txFillPkt : 0, &total, &sent);
+        }
+
+        // Has CoreAudio asked for a different clock source? Unlike a rate change this does not
+        // restart the session — the FF800 keeps streaming while it re-locks — so it is just the two
+        // register surfaces that carry the clock (the CR conf block and the clock-config register,
+        // whose overlap is a documented [?]; uf::UFControl emits both from one shadow).
+        {
+            const uint64_t seq = cap->controlSeq.load(std::memory_order_acquire);
+            if (seq != seenControl) {
+                seenControl = seq;
+                const uint32_t want = cap->requestedClockSource.load(std::memory_order_acquire);
+                if (uf::ctl::is_valid_clock_source(want)) {
+                    const auto src = (uf::ctl::ClockSource)want;
+                    g_settings.clock_master = uf::ctl::clock_source_is_master(src);
+                    g_settings.sync_ref     = uf::ctl::clock_source_sync_ref(src);
+                    uf::UFControl ctlShadow;
+                    ctlShadow.set_sample_rate(rate);
+                    ctlShadow.set_settings(g_settings);
+                    for (const auto& w : {ctlShadow.conf_block_write(), ctlShadow.clock_config_write()}) {
+                        if (w.kind == uf::RegWrite::Kind::Block)
+                            wblock(conn, w.addr, w.quads.data(), (uint32_t)w.quads.size());
+                        else
+                            wq(conn, w.addr, w.quad);
+                    }
+                    std::printf("uf-daemon: clock source -> %s\n", uf::ctl::clock_source_name(src));
+                    std::fflush(stdout);
+                }
+            }
+        }
+
+        // Has CoreAudio asked for a different rate? Checked before the drain so we do not decode a
+        // tick's worth of packets at a geometry we are about to abandon.
+        {
+            const uint64_t req = cap->requestSeq.load(std::memory_order_acquire);
+            if (req != seenRequest) {
+                seenRequest = req;
+                const uint32_t want = cap->requestedRate.load(std::memory_order_acquire);
+                if (want && want != rate && uf::is_supported_rate(want)) {
+                    if (!restart_session(want, "rate change")) break;
+                    continue;
+                }
+            }
+        }
+
+        // The snapshot carries the one thing a round trip cannot: the host time at which the
+        // controller actually completed that packet, taken inside the interrupt handler. Pairing the
+        // frame count with THAT instead of with "whenever the pump got round to asking" is what
+        // takes our scheduling jitter out of the clock CoreAudio reads.
+        uint64_t framesAtSnap = 0;
+        bool haveAnchor = false;
+
         while (consumed < total) {
             const uint8_t* slot = dextBuf + (consumed % (dextSize / kDextSlotBytes)) * kDextSlotBytes;
             const uint32_t* q = reinterpret_cast<const uint32_t*>(slot);
             const uint32_t len = q[1] >> 16;               // iso header data_length (2-quad prefix)
             if (len == 0) ++nEmpty; else if (len == fullPayload) ++nFull; else ++nOther;
             if (q[0] == lastTs) ++nDupTs; lastTs = q[0];   // duplicate iso timestamp = stale re-read
+
+            // Cycle-time drift detection — the factory driver makes the same check in its DMA
+            // callback and actions it from a watchdog as a full stream restart.
+            //
+            // q[0] is the packet's arrival timestamp, low 16 bits: cycleCount[12:0] plus the low 3
+            // bits of cycleSeconds (ohci.c copy_iso_headers reads exactly these). The FF800
+            // transmits in every isochronous cycle, empty packets included, so consecutive packets
+            // must be exactly one cycle apart. Anything else means the controller missed cycles —
+            // capture has a hole in it, and every frame count derived from it after that point is
+            // wrong by the gap. That is a clock discontinuity, not a dropout to paper over.
+            {
+                const uint32_t ts  = q[0] & 0xffff;
+                const uint32_t cyc = (ts & 0x1fff) + ((ts >> 13) & 0x7) * 8000u;   // linear, 8 s span
+                if (haveCycle) {
+                    int32_t d = (int32_t)cyc - (int32_t)lastCycle;
+                    if (d < 0) d += 8 * 8000;             // the 3-bit seconds field wrapped
+                    if (d != 1) { ++cycleGaps; missedCycles += (uint64_t)(d - 1); }
+                    if (d > (int32_t)kCycleGapRestart) worstGap = (uint32_t)d;
+                }
+                lastCycle = cyc; haveCycle = true;
+            }
             if (len && len <= kDextSlotBytes - 8) {
                 const uint8_t* payload = slot + 8;
                 const uint32_t nframes = uf::frames_in_payload(len, dbq);
@@ -370,8 +973,14 @@ int main() {
                     if (!capSlot) { capSlot = cap->acquireWrite(); capFill = 0; }
                     if (capSlot) {
                         uf::decode_frame(payload + (size_t)k * dbq * 4, dbq, frame.data());
+                        int32_t* dst = capSlot->audio + (size_t)capFill * uf::shm::kMaxChannels;
                         for (uint32_t c = 0; c < ch; ++c)
-                            capSlot->audio[capFill * uf::shm::kMaxChannels + c] = frame[c] << 8; // 24->32
+                            dst[c] = frame[c] << 8;                       // 24->32
+                        // The ring frame is always kMaxChannels wide; at 2x/4x the device sends
+                        // fewer (20/12) and the rest of the frame is whatever the previous lap left
+                        // there — audible on the ADAT channels unless cleared.
+                        if (ch < uf::shm::kMaxChannels)
+                            std::memset(dst + ch, 0, (uf::shm::kMaxChannels - ch) * sizeof(int32_t));
                         if (++capFill >= uf::shm::kFramesPerSlot) {
                             capSlot->frameCount = capFill; capSlot->channelCount = ch;
                             cap->commitWrite(); capSlot = nullptr;
@@ -381,22 +990,113 @@ int main() {
                 deviceFrames += nframes;   // TRUE device sample position — advances for every frame
             }
             ++consumed;
+            // The frame position the interrupt's timestamp belongs to.
+            if (haveSnap && consumed == snap.rxCompleted) { framesAtSnap = deviceFrames; haveAnchor = true; }
         }
-        call1(conn, kIsoRelease, consumed);
 
-        // Publish the device-paced clock: {true frame position, now}, ~once per ZeroTimeStampPeriod
-        // (kFramesPerSlot). CoreAudio locks its timeline to this, so it pulls at the real device rate.
-        if (deviceFrames >= lastPublish + uf::shm::kFramesPerSlot) {
-            cap->publishTimestamp((double)deviceFrames, mach_absolute_time());
-            lastPublish = deviceFrames;
+        // A cycle discontinuity big enough to matter is handled the same way RME handles it: restart
+        // the stream. Recovering the timeline any other way would mean guessing how many frames went
+        // missing, and a wrong guess is a permanent offset in the clock CoreAudio is locked to.
+        //
+        // This SELF-ARMS rather than being a flag someone has to set. The detection rests on an
+        // assumption no hardware run has confirmed — that the FF800 transmits in EVERY isochronous
+        // cycle, empty packets included, so consecutive arrival timestamps are always one cycle
+        // apart — and acting on it when it is false would restart the stream continuously, which is
+        // far worse than the fault it detects. But leaving it off by default means it never runs at
+        // all, and a flag nobody remembers to set is not a safety mechanism either.
+        //
+        // So the daemon proves the assumption on the hardware in front of it: stream for
+        // kCycleArmSec with no gaps at all and the premise holds here, so arm. See a gap during that
+        // window and it does not, so stay disarmed and say so. And because "no gaps in ten seconds"
+        // is evidence rather than proof, restarts that come too fast disarm it again — a
+        // false positive costs a few restarts, not an endless loop.
+        {
+            const double upSec = double(mach_absolute_time() - toneStart) * tb.numer / tb.denom / 1e9;
+            if (!cycleArmed && !cycleDisarmed && upSec >= kCycleArmSec) {
+                if (cycleGaps == 0) {
+                    cycleArmed = true;
+                    std::printf("uf-daemon: cycle-continuity restart ARMED (%.0fs, no gaps)\n", upSec);
+                } else {
+                    cycleDisarmed = true;
+                    std::printf("uf-daemon: cycle-continuity restart NOT armed — %llu gaps in the "
+                                "first %.0fs, so this device does not transmit every cycle\n",
+                                (unsigned long long)cycleGaps, upSec);
+                }
+                std::fflush(stdout);
+            }
+        }
+        if (worstGap && cycleArmed && !cycleDisarmed) {
+            const uint32_t gap = worstGap;
+            worstGap = 0;
+            const uint64_t now = mach_absolute_time();
+            const double sinceLast = double(now - lastCycleRestart) * tb.numer / tb.denom / 1e9;
+            lastCycleRestart = now;
+            if (sinceLast < kCycleRestartFloorSec && ++cycleRestartBurst >= 3) {
+                cycleDisarmed = true;
+                std::printf("uf-daemon: cycle-continuity restart DISARMED — 3 restarts inside %.0fs, "
+                            "treating the gaps as normal for this device\n", kCycleRestartFloorSec);
+                std::fflush(stdout);
+            } else {
+                if (sinceLast >= kCycleRestartFloorSec) cycleRestartBurst = 0;
+                ++cycleRestarts;
+                std::printf("uf-daemon: cycle discontinuity — %u cycles missed at once\n", gap - 1);
+                haveCycle = false;
+                if (!restart_session(rate, "cycle-time discontinuity")) break;
+                continue;
+            }
+        }
+        worstGap = 0;   // not armed (or just disarmed): keep counting, do not act
+
+        // Wedge detection. Twice under CoreAudio load the FF800 has dropped off the bus mid-stream
+        // (SR0=SR1=0, capture frozen) and the daemon just spun on the dead connection until it was
+        // killed by hand. Capture silence is the signal: the device transmits continuously whenever
+        // it is alive, so packets not advancing for kWedgeMs means the stream is gone, not idle.
+        // Recovery is the same stop/start a rate change does — the device itself comes back via the
+        // bus reset that the re-claim triggers.
+        if (consumed != lastConsumedForWedge) {
+            lastConsumedForWedge = consumed;
+            lastProgress = mach_absolute_time();
+            wedgeRestarts = 0;                    // real packets: whatever we did last time worked
+        } else if (!getenv("UF_NO_WEDGE_RECOVERY")) {
+            const double stalledMs =
+                double(mach_absolute_time() - lastProgress) * tb.numer / tb.denom / 1e6;
+            // Back off after repeated failures rather than hammering a device that is simply gone
+            // (unplugged, powered off) — a restart storm on the bus helps nobody.
+            const double limit = wedgeRestarts >= 3 ? 5000.0 : kWedgeMs;
+            if (stalledMs > limit) {
+                ++wedgeRestarts;
+                if (!restart_session(rate, "capture stalled — device wedged")) break;
+                continue;
+            }
+        }
+
+        // Publish the device-paced clock anchor, once per ZeroTimeStampPeriod (kFramesPerSlot).
+        // CoreAudio locks its timeline to this, so it pulls at the real device rate.
+        //
+        // The anchor must be the (frame, host time) correspondence at the START of a period: both
+        // libASPL and the HAL index zero timestamps as periodCounter * ZeroTimeStampPeriod. Two
+        // errors creep into the raw cursor. The frame count arrives in 6-frame packet bursts, so it
+        // is essentially never a multiple of 512; and it is read when the PUMP woke, up to a tick
+        // after the frames actually landed, so the host time carries the pump's scheduling jitter.
+        // Both feed straight into the HAL's rate estimate — which is what has to be right for 44.1 k
+        // material to resample cleanly. So: quantise to the boundary just reached, and back-date the
+        // host time by however many frames we have already drained past it.
+        //
+        // The (frames, host time) pair comes from the interrupt when we have one, and from this
+        // thread's own clock only as a fallback.
+        const uint64_t anchorFrames = haveAnchor ? framesAtSnap : deviceFrames;
+        const uint64_t anchorHost   = haveAnchor ? snap.hostTime : mach_absolute_time();
+        if (anchorFrames >= lastPublish + uf::shm::kFramesPerSlot) {
+            lastPublish = anchorFrames / uf::shm::kFramesPerSlot * uf::shm::kFramesPerSlot;
+            const double past = (double)(anchorFrames - lastPublish);
+            cap->publishTimestamp((double)lastPublish,
+                                  anchorHost - (uint64_t)(past * hostTicksPerFrame));
         }
 
         // Playback: encode the plugin's PCM into the transmit ring's FULL slots (blocking mode). Each
         // full slot takes syt_interval frames; empty slots (the 4th of every group) are skipped since
-        // the dext transmits them header-only. SCAFFOLDING: the slot cursor free-runs at the pump
-        // rate, not the isoch clock, so it needs pacing off an IT interrupt/cycle-timer to avoid
-        // drift — verify on hardware. The plugin's frames come as fixed-size shm slots, so we thread a
-        // frame cursor through them.
+        // the dext transmits them header-only. The plugin's frames come as fixed-size shm slots, so
+        // we thread a frame cursor through them.
         if (wavFrames) {
             // Stream the loaded WAV (stereo) to playback ch 0/1 -> outputs 1/2, looping. The tx ring is
             // a static 3840-frame loop the controller reads at 48000/s; we keep it filled with the
@@ -427,32 +1127,122 @@ int main() {
             }
         }
         else if (getenv("UF_TX_SILENT")) { while (play->acquireRead()) play->commitRead(); }
-        else
-        while (const uf::shm::Slot* ps = play->acquireRead()) {
-            const uint32_t pch = ps->channelCount ? ps->channelCount : dbq;
-            for (uint32_t f = 0; f < ps->frameCount; ++f) {
+        else if (txFreeRun)
+        while (const uf::shm::Slot* fps = play->acquireRead()) {
+            const uint32_t pch = fps->channelCount ? fps->channelCount : dbq;
+            for (uint32_t f = 0; f < fps->frameCount; ++f) {
                 // Skip empty tx slots (same cadence the dext programmed) so audio only lands in packets
                 // that are actually transmitted.
                 while (!uf::is_full_packet(txCursor % kTxSlots, fullCount)) ++txCursor;
                 if (txFill == 0) txSlotPtr = txBuf + (size_t)(txCursor % kTxSlots) * kTxSlotBytes;
                 uint8_t* fr = txSlotPtr + (size_t)txFill * dbq * 4;
                 for (uint32_t c = 0; c < dbq; ++c) {
-                    int32_t s = (c < pch) ? ps->audio[(size_t)f * pch + c] : 0;
+                    int32_t s = (c < pch) ? fps->audio[(size_t)f * pch + c] : 0;
                     uf::encode_sample_le(s >> 8, fr + (size_t)c * 4);   // ring int32 -> 24-bit sample
                 }
                 if (++txFill >= sytInterval) { txFill = 0; ++txCursor; }
             }
             play->commitRead();
         }
+        else {
+            // Paced fill: keep exactly kTxLeadPkts packets of the ring written ahead of the
+            // controller's transmit head. The old free-running cursor above advanced at the pump's
+            // wake-up rate with nothing tying it to the hardware, so the write and read positions
+            // slid through each other and the audio tore every few tens of seconds.
+            txLastSent = sent;
+            if (txFillPkt < sent + kTxMinLeadPkts || txFillPkt - sent > kTxSlots) {
+                txFillPkt = sent + kTxLeadPkts;   // stalled long enough to lose the race
+                ++txResyncs;
+            }
+            const uint64_t target = sent + kTxLeadPkts;
+            bool dry = false;
+            for (; txFillPkt < target; ++txFillPkt) {
+                const uint32_t slot = (uint32_t)(txFillPkt % kTxSlots);
+                if (!uf::is_full_packet(slot, fullCount, kTxSlots)) continue;  // empty packet, no payload
 
-        usleep(1000);   // ~1 ms; a real daemon waits on an interrupt, not a sleep
+                // Servo: this packet carries sytInterval frames, plus one whenever the accumulated
+                // fractional debt against the measured device rate reaches a frame (or minus one if we
+                // are running ahead). At 48000 base vs ~48002 measured that is ~one extra frame every
+                // ~0.5 s — enough to keep the device FIFO from draining without ever overflowing it.
+                uint32_t frames = sytInterval;
+                if (servoOn && servoReady) {
+                    servoAccum += (measuredRate - baseRate) / 8000.0;
+                    if (servoAccum > 4.0) servoAccum = 4.0;      // a bad estimate can't run away
+                    else if (servoAccum < -4.0) servoAccum = -4.0;
+                    if (servoAccum >= 1.0)      { ++frames; servoAccum -= 1.0; }
+                    else if (servoAccum <= -1.0){ --frames; servoAccum += 1.0; }
+                }
+                const uint32_t wantBytes = frames * dbq * 4;
+                if (slotBytes[slot] != wantBytes) {   // reprogram this slot's descriptor once
+                    uint64_t a[2] = {slot, wantBytes};
+                    IOConnectCallScalarMethod(conn, kIsoTxSetBytes, a, 2, nullptr, nullptr);
+                    slotBytes[slot] = wantBytes;
+                }
+
+                uint8_t* base = txBuf + (size_t)slot * kTxSlotBytes;
+                for (uint32_t f = 0; f < frames; ++f) {
+                    int32_t src[uf::shm::kMaxChannels] = {0};
+                    uint32_t nsrc = 0;
+                    if (pacedToneCh >= 0) {
+                        // Top-justified like a shm-ring sample (the encode below applies >>8): 2^30 = -6 dBFS.
+                        if (pacedToneCh < (int)dbq) src[pacedToneCh] = (int32_t)(1073741824.0 * std::sin(pacedTonePhase));
+                        pacedTonePhase += pacedTonePhaseInc;
+                        if (pacedTonePhase > 2.0 * M_PI) pacedTonePhase -= 2.0 * M_PI;
+                        nsrc = dbq;
+                    } else {
+                        if (ps && psPos >= ps->frameCount) { play->commitRead(); ps = nullptr; }
+                        // One acquire attempt per tick: the plugin having nothing for us is normal at
+                        // startup, and retrying per frame would bury the ring's underrun counter.
+                        if (!ps && !dry) { ps = play->acquireRead(); psPos = 0; if (!ps) dry = true; }
+                        nsrc = ps ? (ps->channelCount ? ps->channelCount : dbq) : 0;
+                    }
+                    uint8_t* fr = base + (size_t)f * dbq * 4;
+                    for (uint32_t c = 0; c < dbq; ++c) {
+                        int32_t s = (pacedToneCh >= 0) ? src[c]
+                                  : (ps && c < nsrc) ? ps->audio[(size_t)psPos * nsrc + c] : 0;
+                        uf::encode_sample_le(s >> 8, fr + (size_t)c * 4);   // ring int32 -> 24-bit
+                    }
+                    if (pacedToneCh < 0 && ps) ++psPos;
+                }
+            }
+            if (dry) ++txDry;   // the refill is handed back on the next tick's pump_dext
+        }
+
+        // Sample how much playback the plugin is keeping ahead of us. The minimum over a
+        // second is the real headroom the safety offset is buying (see MARGIN above).
+        { const uint64_t d = play->depth(); if (d < playMinDepth) playMinDepth = d; }
+
+        // Wait for the next tick. Blocking on the isochronous completion interrupt means the pump
+        // wakes because the hardware moved, not because a timer said so: no phase drift against the
+        // DMA, and no window where the controller has finished a packet but nobody is awake to
+        // notice. The timeout is a safety net, not the pacing — at kUFOhciIrqEvery=8 an interrupt is
+        // due every millisecond, so hitting it means the stream has stopped (a wedge), and we fall
+        // through to run the tick anyway so the wedge shows up in the per-second stats.
+        //
+        // Without the interrupt we sleep to an ABSOLUTE deadline rather than for a relative
+        // interval: usleep(1000) made each tick take work+1 ms, so the pump ran slower than 1 kHz by
+        // however long its work took and the period wandered with load.
+        if (irqPump) {
+            if (!wake_wait(wakePort, 20)) ++wakeTimeouts;
+        } else {
+            deadline += kPumpPeriodTicks;
+            const uint64_t nowTicks = mach_absolute_time();
+            if (deadline < nowTicks) {      // overran the period; resync rather than chase a backlog
+                deadline = nowTicks + kPumpPeriodTicks;
+                ++pumpLate;
+            }
+            mach_wait_until(deadline);
+        }
     }
 
-    std::printf("uf-daemon: stopping\n");
-    { std::vector<uint32_t> ones(dbq, 1); wblock(conn, uf::reg::kStatus0, ones.data(), dbq); }  // fetch off
-    IOConnectCallScalarMethod(conn, kIsoStop, nullptr, 0, nullptr, nullptr);
-    IOConnectCallScalarMethod(conn, kIsoTxStop, nullptr, 0, nullptr, nullptr);
-    { const uint32_t blob[3] = {0u,0u,0u}; wblock(conn, uf::reg::kInitBankStop, blob, 3); }   // 0x0002 comm-stop
+    std::printf("uf-daemon: stopping (%llu session restarts)\n", (unsigned long long)restarts);
+    if (midiClient) {
+        IOConnectCallScalarMethod(conn, kUFOhciMidiInDisable, nullptr, 0, nullptr, nullptr);
+        g_midiSrc = 0;
+        MIDIClientDispose(midiClient);   // disposes the endpoints it owns
+    }
+    cap->deviceRate.store(0, std::memory_order_release);
+    session_stop(conn, ses);
     shm_unlink(uf::shm::kCaptureName);
     shm_unlink(uf::shm::kPlaybackName);
     IOServiceClose(conn);

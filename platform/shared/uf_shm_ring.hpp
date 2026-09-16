@@ -51,8 +51,33 @@ struct Ring {
     // it before and after the pair and retry on a mismatch (torn read). This is the SPSC audio-clock
     // equivalent of the factory driver's timestamp-on-ring-wrap.
     alignas(kCacheLine) std::atomic<uint64_t> tsSeed;      // increments on every timestamp publish
-    double   tsSampleTime;                                 // frame count at tsHostTime
-    uint64_t tsHostTime;                                   // mach_absolute_time at that frame
+    std::atomic<double>   tsSampleTime;                    // frame count at tsHostTime
+    std::atomic<uint64_t> tsHostTime;                      // mach_absolute_time at that frame
+
+    // Rate agreement. CoreAudio picks the sample rate; the daemon owns the device that has to be at
+    // it. Without this channel the two silently disagree — the HAL sets its nominal rate to 44100,
+    // the daemon keeps streaming 48000, and since our sample times count REAL device frames the HAL
+    // reads the device as running 8.8% fast. That is the "44.1k sounds robotic" symptom.
+    //
+    // deviceRate is the truth (what is actually on the wire) and only the daemon writes it.
+    // requestedRate/requestSeq are the plugin asking for a change; the daemon acts on a new seq and
+    // republishes deviceRate when the session is back up. The plugin must not present device-paced
+    // timestamps while the two disagree — mid-switch, the frames it would be reporting are in the
+    // wrong unit.
+    alignas(kCacheLine) std::atomic<uint32_t> deviceRate;    // daemon -> plugin: rate on the wire
+    std::atomic<uint32_t> requestedRate;                     // plugin -> daemon: rate CoreAudio wants
+    std::atomic<uint64_t> requestSeq;                        // plugin -> daemon: bumps per request
+
+    // Control plane. Same shape as the rate channel: the daemon owns the device and publishes what
+    // is true, the plugin publishes what CoreAudio asked for, and a sequence number distinguishes a
+    // new request from a repeat. clockSource is the source the DEVICE reports it is locked to, not
+    // the one we asked for — an external clock can vanish and leave it back on its crystal, and the
+    // right thing to show a user is what is actually driving the converters. Values are
+    // uf::ctl::ClockSource.
+    alignas(kCacheLine) std::atomic<uint32_t> clockSource;   // daemon -> plugin: ACTIVE source
+    std::atomic<uint32_t> clockLocked;                       // daemon -> plugin: 1 = locked+synced
+    std::atomic<uint32_t> requestedClockSource;              // plugin -> daemon
+    std::atomic<uint64_t> controlSeq;                        // plugin -> daemon: bumps per request
 
     alignas(kCacheLine) Slot slot[kSlots];
 
@@ -63,28 +88,41 @@ struct Ring {
         overruns.store(0, std::memory_order_relaxed);
         underruns.store(0, std::memory_order_relaxed);
         tsSeed.store(0, std::memory_order_relaxed);
-        tsSampleTime = 0; tsHostTime = 0;
+        tsSampleTime.store(0, std::memory_order_relaxed);
+        tsHostTime.store(0, std::memory_order_relaxed);
+        deviceRate.store(0, std::memory_order_relaxed);     // 0 = the daemon has not said yet
+        requestedRate.store(0, std::memory_order_relaxed);
+        requestSeq.store(0, std::memory_order_relaxed);
+        clockSource.store(0, std::memory_order_relaxed);    // Internal
+        clockLocked.store(0, std::memory_order_relaxed);
+        requestedClockSource.store(0, std::memory_order_relaxed);
+        controlSeq.store(0, std::memory_order_relaxed);
     }
 
     // Producer (daemon) publishes the device-paced clock anchor. seed brackets the write.
     void publishTimestamp(double sampleTime, uint64_t hostTime) noexcept {
         const uint64_t s = tsSeed.load(std::memory_order_relaxed) + 1;
-        tsSeed.store(s, std::memory_order_release);        // odd => write in progress
-        std::atomic_thread_fence(std::memory_order_release);
-        tsSampleTime = sampleTime; tsHostTime = hostTime;
-        tsSeed.store(s + 1, std::memory_order_release);    // even => stable
+        tsSeed.store(s, std::memory_order_relaxed);        // odd => write in progress
+        std::atomic_thread_fence(std::memory_order_release);   // odd marker lands before the payload
+        tsSampleTime.store(sampleTime, std::memory_order_relaxed);
+        tsHostTime.store(hostTime, std::memory_order_relaxed);
+        tsSeed.store(s + 1, std::memory_order_release);    // even => stable, payload published
     }
 
     // Consumer (plugin, RT thread) reads a coherent {sampleTime, hostTime, seed}. Returns false on a
     // torn read (caller retries) or before the first publish.
+    //
+    // The trailing fence is load-bearing and must sit BEFORE the second seed load: an acquire *load*
+    // only orders what follows it, so without the fence both the compiler and arm64 may sink the two
+    // payload loads past it and the seed comparison then validates values it never actually read.
     bool readTimestamp(double* sampleTime, uint64_t* hostTime, uint64_t* seed) const noexcept {
         const uint64_t s0 = tsSeed.load(std::memory_order_acquire);
         if (s0 == 0 || (s0 & 1)) return false;
+        const double   st = tsSampleTime.load(std::memory_order_relaxed);
+        const uint64_t ht = tsHostTime.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
-        *sampleTime = tsSampleTime; *hostTime = tsHostTime;
-        const uint64_t s1 = tsSeed.load(std::memory_order_acquire);
-        if (s1 != s0) return false;
-        *seed = s0;
+        if (tsSeed.load(std::memory_order_relaxed) != s0) return false;
+        *sampleTime = st; *hostTime = ht; *seed = s0;
         return true;
     }
 
@@ -110,5 +148,11 @@ struct Ring {
         return head.load(std::memory_order_acquire) - tail.load(std::memory_order_acquire);
     }
 };
+
+// The Ring is mapped by two processes, so every atomic in it must be genuinely lock-free: a libc++
+// lock-table fallback would take a per-process lock and synchronise nothing across the mapping.
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+static_assert(std::atomic<double>::is_always_lock_free);
 
 }  // namespace uf::shm

@@ -55,6 +55,10 @@ IMPL(UFFireWireOHCIUserClient, CopyClientMemoryForType)
         *options = 0;
         return ivars->driver->CopyTxBuffer(memory);
     }
+    if (type == kUFOhciStatusMemoryType) {       // interrupt status + the daemon's cursors back
+        *options = 0;                            // read-write: the control half is client-written
+        return ivars->driver->CopyStatusBuffer(memory);
+    }
     return CopyClientMemoryForType(type, options, memory, SUPERDISPATCH);
 }
 
@@ -131,15 +135,17 @@ UFFireWireOHCIUserClient::ExternalMethod(uint64_t selector,
             return ivars->driver->MidiInEnable((uint32_t)arguments->scalarInput[0]);
         }
         case kUFOhciMidiInPoll: {
-            uint8_t bytes[256];
+            uint8_t bytes[8] = {0};
             uint32_t count = sizeof(bytes);
             kern_return_t r = ivars->driver->MidiInPoll(bytes, &count);
             if (r != kIOReturnSuccess) return r;
-            if (arguments->structureOutput) {
-                const uint32_t cap = (uint32_t)arguments->structureOutput->getLength();
-                const uint32_t nb = count < cap ? count : cap;
-                memcpy((void*)arguments->structureOutput->getBytesNoCopy(), bytes, nb);
-                // structureOutputDescriptor length reflects what we wrote (best-effort).
+            if (arguments->scalarOutput && arguments->scalarOutputCount >= 2) {
+                uint64_t packed = 0;
+                for (uint32_t i = 0; i < count && i < 8; ++i)
+                    packed |= (uint64_t)bytes[i] << (8 * i);
+                arguments->scalarOutput[0] = count;
+                arguments->scalarOutput[1] = packed;
+                arguments->scalarOutputCount = 2;
             }
             return kIOReturnSuccess;
         }
@@ -154,6 +160,53 @@ UFFireWireOHCIUserClient::ExternalMethod(uint64_t selector,
         }
         case kUFOhciIsoTxStop:
             return ivars->driver->IsoTxStop();
+        case kUFOhciIsoTxSent: {
+            uint64_t sent = 0;
+            kern_return_t r = ivars->driver->IsoTxSent(&sent);
+            if (r != kIOReturnSuccess) return r;
+            if (arguments->scalarOutput && arguments->scalarOutputCount >= 1) {
+                arguments->scalarOutput[0] = sent; arguments->scalarOutputCount = 1;
+            }
+            return kIOReturnSuccess;
+        }
+        case kUFOhciIsoTxRefill: {
+            if (arguments->scalarInputCount < 1 || arguments->scalarInput == nullptr)
+                return kIOReturnBadArgument;
+            return ivars->driver->IsoTxRefill(arguments->scalarInput[0]);
+        }
+        case kUFOhciIsoTxSetBytes: {
+            if (arguments->scalarInputCount < 2 || arguments->scalarInput == nullptr)
+                return kIOReturnBadArgument;
+            return ivars->driver->IsoTxSetSlotBytes((uint32_t)arguments->scalarInput[0],
+                                                    (uint32_t)arguments->scalarInput[1]);
+        }
+        case kUFOhciDebugInbound:
+            return ivars->driver->DebugPollInbound();
+        case kUFOhciIsoWake: {
+            // A standing subscription, not a request: we keep the completion action and re-fire it
+            // on every isochronous completion interrupt, so this method never "returns" a result.
+            // Called with a null completion (an ordinary synchronous call) it unsubscribes.
+            return ivars->driver->SetIsoWake(this, arguments->completion);
+        }
+        case kUFOhciPump: {
+            // A whole pump tick in one IPC: hand back the slots we consumed, then report where the
+            // controller is on both contexts. Per-call failures are swallowed on purpose — with
+            // transmit disabled the tx half is simply not running, and that must not fail the poll
+            // the capture path depends on.
+            if (arguments->scalarInputCount < 2 || arguments->scalarInput == nullptr)
+                return kIOReturnBadArgument;
+            ivars->driver->IsoRelease(arguments->scalarInput[0]);
+            if (arguments->scalarInput[1]) ivars->driver->IsoTxRefill(arguments->scalarInput[1]);
+            uint64_t completed = 0, sent = 0;
+            ivars->driver->IsoCompletedCount(&completed);
+            ivars->driver->IsoTxSent(&sent);
+            if (arguments->scalarOutput && arguments->scalarOutputCount >= 2) {
+                arguments->scalarOutput[0] = completed;
+                arguments->scalarOutput[1] = sent;
+                arguments->scalarOutputCount = 2;
+            }
+            return kIOReturnSuccess;
+        }
         case kUFOhciReadCycleTimer: {
             uint32_t value = 0;
             kern_return_t r = ivars->driver->ReadCycleTimer(&value);

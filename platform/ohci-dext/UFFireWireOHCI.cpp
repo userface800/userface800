@@ -33,6 +33,11 @@
 struct UFFireWireOHCI_IVars;
 static void ohci_identify(UFFireWireOHCI_IVars* v, uint16_t node, uint32_t speed);
 static kern_return_t uf_send_phy_config(UFFireWireOHCI_IVars* v, uint8_t root_phy_id);
+// Defined down with the isochronous contexts, whose ring constants it needs; called from the
+// interrupt handler well above them.
+static void uf_iso_completion(UFFireWireOHCI_IVars* v);
+static void uf_it_refill(UFFireWireOHCI_IVars* v, uint64_t upTo);
+static constexpr uint32_t kIRContext = 0;   // the one isochronous receive context we use
 
 static constexpr uint32_t kSelfIDBufferBytes = 2048;  // OHCI self-ID buffer, 2 KB aligned
 static constexpr uint16_t kARBufferBytes    = 4096;  // AR response receive buffer
@@ -89,6 +94,19 @@ struct UFFireWireOHCI_IVars {
     IOMemoryMap*               itPayMap;
     uint64_t                   itPayAddr;
     bool                       itRunning;
+    uint64_t                   itSentCursor;   // monotonic packets the controller has transmitted
+    uint64_t                   itFillCursor;   // monotonic packets the daemon has refilled
+    uint32_t                   itFullCount;    // full packets per ring lap (the blocking cadence)
+
+    // Interrupt-driven pump: the status page the isoch completion handler publishes into, and the
+    // client + action it signals afterwards (see UFFireWireOHCIShared.h).
+    IOBufferMemoryDescriptor*  statusBuf;
+    IOMemoryMap*               statusMap;
+    struct UFOhciStatus*       status;
+    IOUserClient*              wakeClient;
+    OSAction*                  wakeAction;
+    uint32_t                   isoIrqEvery;    // capture packets between completion interrupts
+    uint64_t                   isoIrqCount;
 
     IOBufferMemoryDescriptor*  payloadBuf; // AT block-request payload (device reads it by DMA)
     IODMACommand*              payloadDMA;
@@ -131,6 +149,7 @@ struct UFFireWireOHCI_IVars {
     uint16_t                   midiHighIndex; // the high-address index we advertised to the FF800
     bool                       midiInOn;
     uint32_t                   arReqReadBytes; // how far we have parsed the AR-request buffer
+    uint32_t                   dbgArReadBytes; // DIAGNOSTIC: separate cursor for the inbound-request logger
 };
 
 // ── Register access (OHCI BAR0 MMIO) — reg_read/reg_write equivalents ─────────────────────────
@@ -141,6 +160,23 @@ static inline uint32_t reg_read(IOPCIDevice* pci, uint8_t bar, uint32_t off) {
 }
 static inline void reg_write(IOPCIDevice* pci, uint8_t bar, uint32_t off, uint32_t v) {
     pci->MemoryWrite32(bar, off, v);
+}
+
+// IEEE-1212 config-ROM block CRC (Linux fw_compute_block_crc uses crc_itu_t = CRC-16-CCITT, poly
+// 0x1021, init 0, computed over the big-endian bytes of the block). A ROM reader that verifies the
+// CRC — which a full 1394 stack does — rejects a block whose stored CRC is wrong, so our old ROM
+// (CRC left 0) reads as invalid. `quads` are host-order; the CRC runs over their bus-order bytes.
+static uint16_t uf_rom_crc16(const uint32_t* quads, int len)
+{
+    uint16_t crc = 0;
+    for (int i = 0; i < len; ++i) {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            crc ^= (uint16_t)((quads[i] >> shift) & 0xff) << 8;
+            for (int b = 0; b < 8; ++b)
+                crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
 }
 
 bool UFFireWireOHCI::init()
@@ -195,6 +231,10 @@ void UFFireWireOHCI::free()
         OSSafeReleaseNULL(ivars->arDescDMA);
         OSSafeReleaseNULL(ivars->arDescMap);
         OSSafeReleaseNULL(ivars->arDescBuf);
+        OSSafeReleaseNULL(ivars->wakeAction);
+        OSSafeReleaseNULL(ivars->wakeClient);
+        OSSafeReleaseNULL(ivars->statusMap);
+        OSSafeReleaseNULL(ivars->statusBuf);
         IOSafeDeleteNULL(ivars, UFFireWireOHCI_IVars, 1);
     }
     super::free();
@@ -313,6 +353,18 @@ IMPL(UFFireWireOHCI, Start)
     // Clear all interrupt state.
     reg_write(ivars->pci, ivars->barIndex, OHCI_IntEventClear, ~0u);
     reg_write(ivars->pci, ivars->barIndex, OHCI_IntMaskClear, ~0u);
+
+    // The status page the isochronous interrupt publishes into. Plain host memory the client maps —
+    // the controller never touches it, so it needs no IODMACommand.
+    ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, kUFOhciStatusBytes, 8,
+                                           &ivars->statusBuf);
+    if (ret != kIOReturnSuccess) return ret;
+    ret = ivars->statusBuf->CreateMapping(0, 0, 0, 0, 0, &ivars->statusMap);
+    if (ret != kIOReturnSuccess) return ret;
+    ivars->status = reinterpret_cast<struct UFOhciStatus*>(ivars->statusMap->GetAddress());
+    // The whole page, not just the status struct: the control block further in is read by the
+    // interrupt handler, and uninitialised memory there would be applied as a cursor.
+    memset(ivars->status, 0, kUFOhciStatusBytes);
 
     // ── Wire the MSI interrupt (IOInterruptDispatchSource) ────────────────────────────────────
     ret = IODispatchQueue::Create("UFFireWireOHCI.irq", 0, 0, &ivars->queue);
@@ -515,27 +567,32 @@ IMPL(UFFireWireOHCI, Start)
         ivars->romAddr = sg.address;
 
         // BusOptions: start from what the hardware reports (max_rec, link speed) and declare
-        // ourselves cycle-master and isochronous capable, but NOT bus-manager capable (we implement
-        // no BM). irmc off for the same reason: we do not serve the IRM registers.
+        // ourselves cycle-master + isochronous capable. max_rom = 2 (bits 9:8) is REQUIRED: it tells
+        // peers the ROM is the general (block-readable) format, so the FF800 can block-read the whole
+        // ROM below the bus-info block. Without it a peer only ever quadlet-reads the bus-info block
+        // and never sees the root directory / node capabilities — i.e. we look like a stub node. We
+        // still leave irmc/bmc off: we serve no IRM/BM registers and must not claim to.
         uint32_t busOptions = reg_read(ivars->pci, ivars->barIndex, OHCI_BusOptions);
-        busOptions |=  (1u << 30) | (1u << 29);            // cmc | isc
-        busOptions &= ~((1u << 31) | (1u << 28));          // irmc | bmc off
+        busOptions |=  (1u << 30) | (1u << 29) | (2u << 8);   // cmc | isc | max_rom=2
+        busOptions &= ~((1u << 31) | (1u << 28));             // irmc | bmc off
 
-        // bus_info_length = 4, crc_length = 4 (crc 0: nothing on this bus verifies it).
-        ivars->romHeader = (4u << 24) | (4u << 16);
-        const uint32_t oui = (guidHi >> 8) & 0xffffff;     // our OUI, from the controller's GUID
-
-        // The image is DMA'd out as packet payload, i.e. in BUS order — big-endian, like ohci.c's
-        // __be32 config_rom. Only the register writes below take host order.
-        uint32_t rom[7] = {
-            ivars->romHeader,
-            0x31333934,                    // "1394"
-            busOptions,
-            guidHi,
-            guidLo,
-            (1u << 16),                    // root directory: 1 entry
-            (0x03u << 24) | oui,           // Module_Vendor_ID
-        };
+        // A COMPLETE IEEE-1212 config ROM matching what a full 1394 stack (IOFireWireFamily / Linux
+        // core-card.c generate_config_rom) publishes for a host node: bus-info block + a root
+        // directory whose single entry is Node_Capabilities (0x0c0083c0, per IEEE 1394 8.3.2.6.5.2).
+        // Every block carries a valid CRC — a reader that verifies CRCs rejects a block whose CRC is
+        // wrong, which is why the old CRC-0 ROM read as invalid. The image is DMA'd out as packet
+        // payload in BUS order (big-endian); only the register writes below take host order.
+        uint32_t rom[7];
+        rom[1] = 0x31333934;               // "1394"
+        rom[2] = busOptions;
+        rom[3] = guidHi;
+        rom[4] = guidLo;
+        const uint16_t bibCrc = uf_rom_crc16(&rom[1], 4);   // bus-info block CRC over quads 1..4
+        rom[0] = (4u << 24) | (4u << 16) | bibCrc;          // info_len=4, crc_len=4, crc
+        rom[6] = 0x0c0083c0;               // Node_Capabilities (immediate root-dir entry)
+        const uint16_t rootCrc = uf_rom_crc16(&rom[6], 1);  // root directory CRC over its 1 entry
+        rom[5] = (1u << 16) | rootCrc;                      // root dir: length 1, crc
+        ivars->romHeader = rom[0];                          // quadlet reads of ROM[0] must carry the CRC too
         for (unsigned i = 0; i < 7; ++i) ivars->romCPU[i] = __builtin_bswap32(rom[i]);
 
         // ohci.c writes a zero header until self-ID completes, so a peer never reads a ROM that is
@@ -553,9 +610,17 @@ IMPL(UFFireWireOHCI, Start)
     reg_write(ivars->pci, ivars->barIndex, OHCI_AsReqFilterHiSet, 0x80000000);
 
     // Enable the interrupts we handle + master enable, then bring the link up.
+    //
+    // isochRx is what makes the daemon's pump interrupt-driven rather than a 1 ms poll: the capture
+    // context raises it on descriptors we mark, which are paced by the FF800's own transmit cadence,
+    // so the pump runs on the device's clock instead of a host timer that drifts against it.
+    // isochTx is enabled only so a stray transmit completion gets acknowledged — we deliberately
+    // mark no IT descriptor for interrupt, since capture and transmit ride the same 8 kHz isochronous
+    // cycle and one wake source per cycle is enough for both halves of the pump.
     reg_write(ivars->pci, ivars->barIndex, OHCI_IntMaskSet,
               Int_busReset | Int_selfIDComplete | Int_postedWriteErr | Int_regAccessFail |
-              Int_unrecoverableError | Int_cycleTooLong | Int_masterEnable);
+              Int_unrecoverableError | Int_cycleTooLong | Int_isochRx | Int_isochTx |
+              Int_masterEnable);
     reg_write(ivars->pci, ivars->barIndex, OHCI_HCControlSet,
               HCControl_linkEnable | HCControl_BIBimageValid);
 
@@ -605,6 +670,21 @@ IMPL(UFFireWireOHCI, InterruptOccurred)
 
     if (event & (Int_postedWriteErr | Int_regAccessFail | Int_unrecoverableError))
         os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: controller error event 0x%08x", event);
+
+    // Isochronous DMA completion — the audio clock. Both bits are the OR of their per-context event
+    // registers and are not clearable via IntEventClear, so the per-context registers are cleared
+    // here; miss that and the controller re-interrupts on the same event forever.
+    if (event & (Int_isochRx | Int_isochTx)) {
+        if (event & Int_isochTx) {
+            uint32_t tx = reg_read(ivars->pci, ivars->barIndex, OHCI_IsoXmitIntEventClear);
+            if (tx) reg_write(ivars->pci, ivars->barIndex, OHCI_IsoXmitIntEventClear, tx);
+        }
+        if (event & Int_isochRx) {
+            uint32_t rx = reg_read(ivars->pci, ivars->barIndex, OHCI_IsoRecvIntEventClear);
+            if (rx) reg_write(ivars->pci, ivars->barIndex, OHCI_IsoRecvIntEventClear, rx);
+            if (rx & (1u << kIRContext)) uf_iso_completion(ivars);
+        }
+    }
 
     if (event & Int_cycleTooLong) {
         // The hardware clears cycleMaster on this event; ohci.c puts it straight back — but only if
@@ -955,7 +1035,6 @@ kern_return_t UFFireWireOHCI::WriteBlock(uint64_t offset, const uint32_t* quads,
 // 4-byte isochronous header. The descriptor program is a straight run of `packets` INPUT_LAST
 // descriptors that ends (branch = 0) rather than looping, so a capture stops by itself and the
 // client can read the whole buffer without racing the controller.
-static constexpr uint32_t kIRContext = 0;
 
 kern_return_t UFFireWireOHCI::IsoStart(uint32_t channel, uint32_t packets)
 {
@@ -1020,6 +1099,7 @@ kern_return_t UFFireWireOHCI::IsoPoll(uint32_t* received)
 kern_return_t UFFireWireOHCI::IsoStop()
 {
     if (!ivars->isoRunning) return kIOReturnSuccess;
+    reg_write(ivars->pci, ivars->barIndex, OHCI_IsoRecvIntMaskClear, 1u << kIRContext);
     uf_ctx_stop(ivars, OHCI_IR_CTX_BASE(kIRContext));
     ivars->isoRunning = false;
     ivars->isoContinuous = false;
@@ -1040,7 +1120,11 @@ kern_return_t UFFireWireOHCI::IsoStartContinuous(uint32_t channel)
         d[i].req_count       = kUFOhciIsoSlotBytes;
         d[i].res_count       = 0;
         d[i].transfer_status = 0;
-        d[i].control         = (uint16_t)(DESC_INPUT_LAST | DESC_STATUS | DESC_BRANCH_ALWAYS);
+        // Every kUFOhciIrqEvery-th descriptor raises the completion interrupt that drives the pump.
+        // Marking all of them would be 8000 interrupts a second for no extra timing information;
+        // marking none is what left the daemon with nothing to block on but a timer.
+        d[i].control         = (uint16_t)(DESC_INPUT_LAST | DESC_STATUS | DESC_BRANCH_ALWAYS |
+                                          ((i % kUFOhciIrqEvery) == 0 ? DESC_IRQ_ALWAYS : 0));
         d[i].data_address    = (uint32_t)(ivars->isoAddr + (uint64_t)i * kUFOhciIsoSlotBytes);
         d[i].branch_address  = (uint32_t)(ivars->isoDescAddr +
                                           (uint64_t)((i + 1) % n) * sizeof(*d)) | 1;   // wrap
@@ -1050,13 +1134,18 @@ kern_return_t UFFireWireOHCI::IsoStartContinuous(uint32_t channel)
     ivars->isoReadCursor  = 0;
     ivars->isoRunning     = true;
     ivars->isoContinuous  = true;
+    ivars->isoIrqEvery    = kUFOhciIrqEvery;
 
     reg_write(ivars->pci, ivars->barIndex, OHCI_IsoRecvIntEventClear, 1u << kIRContext);
+    // Unmask this context's completion interrupt. The top-level Int_isochRx enabled in Start() is
+    // only the OR of these per-context bits; without this one set, no isoch interrupt ever fires.
+    reg_write(ivars->pci, ivars->barIndex, OHCI_IsoRecvIntMaskSet, 1u << kIRContext);
     reg_write(ivars->pci, ivars->barIndex, CTX_MATCH(base), IR_MATCH(0xf, 0, channel));
     reg_write(ivars->pci, ivars->barIndex, CTX_COMMAND_PTR(base), (uint32_t)ivars->isoDescAddr | 1);
     reg_write(ivars->pci, ivars->barIndex, CTX_CONTROL_SET(base), CTX_RUN | IR_CTX_ISOCH_HEADER);
-    os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: continuous iso capture on channel %u (%u-slot ring)",
-           channel, n);
+    os_log(OS_LOG_DEFAULT,
+           "UFFireWireOHCI: continuous iso capture on channel %u (%u-slot ring, irq every %u)",
+           channel, n, kUFOhciIrqEvery);
     return kIOReturnSuccess;
 }
 
@@ -1076,17 +1165,25 @@ kern_return_t UFFireWireOHCI::IsoCompletedCount(uint64_t* total)
 }
 
 // The daemon has consumed packets up to `upTo`; re-arm those descriptors for the controller to reuse.
-kern_return_t UFFireWireOHCI::IsoRelease(uint64_t upTo)
+// Split from the external method so the completion interrupt can apply the daemon's cursor straight
+// from the shared control block, without a round trip.
+static void uf_iso_release(UFFireWireOHCI_IVars* v, uint64_t upTo)
 {
-    struct ohci_descriptor* d = (struct ohci_descriptor*)ivars->isoDescCPU;
-    const uint32_t n = ivars->isoPackets;
-    if (upTo > ivars->isoWriteCursor) upTo = ivars->isoWriteCursor;
-    while (ivars->isoReadCursor < upTo) {
-        const uint32_t i = (uint32_t)(ivars->isoReadCursor % n);
+    struct ohci_descriptor* d = (struct ohci_descriptor*)v->isoDescCPU;
+    const uint32_t n = v->isoPackets;
+    if (!n) return;
+    if (upTo > v->isoWriteCursor) upTo = v->isoWriteCursor;
+    while (v->isoReadCursor < upTo) {
+        const uint32_t i = (uint32_t)(v->isoReadCursor % n);
         d[i].res_count       = 0;
         d[i].transfer_status = 0;   // re-arm; the wrapping branch brings the controller back here
-        ++ivars->isoReadCursor;
+        ++v->isoReadCursor;
     }
+}
+
+kern_return_t UFFireWireOHCI::IsoRelease(uint64_t upTo)
+{
+    uf_iso_release(ivars, upTo);
     return kIOReturnSuccess;
 }
 
@@ -1116,6 +1213,101 @@ kern_return_t UFFireWireOHCI::CopyTxBuffer(IOMemoryDescriptor** memory)
 // The ring is 64 self-looping 3-descriptor blocks; packet i transmits slot i of the payload ring.
 static constexpr uint32_t kITContext = 0;
 static constexpr uint32_t kITPackets = kUFOhciTxSlots;   // 640: exact blocking period
+
+// ── The isochronous completion interrupt: the audio clock ─────────────────────────────────────
+// Runs on the interrupt queue every kUFOhciIrqEvery captured packets, i.e. paced by the FF800's own
+// transmit cadence rather than by a host timer. It does the pump's read half — advance both DMA
+// cursors, stamp when the controller actually got there — publishes that to the status page, and
+// wakes the daemon.
+//
+// Taking the timestamp HERE is the point of the exercise. The daemon's 1 ms polling loop learned the
+// same cursors up to a tick late and with whatever jitter the scheduler added, and that jitter went
+// straight into the clock anchor CoreAudio uses to estimate the device rate. This is the userland
+// equivalent of the factory driver timestamping inside its own DMA callback.
+static void uf_iso_completion(UFFireWireOHCI_IVars* v)
+{
+    if (!v->status) return;
+    // Both samples first, before any scanning work, so they describe the completion rather than the
+    // time we finished bookkeeping. hostTime is the CPU clock CoreAudio speaks; cycleTimer is the
+    // FireWire bus clock our transmit is paced by, and the daemon's servo compares the two.
+    const uint64_t host  = mach_absolute_time();
+    const uint32_t cycle = reg_read(v->pci, v->barIndex, OHCI_IsochronousCycleTimer);
+
+    // Apply the daemon's cursors from the shared control block: re-arm the capture descriptors it
+    // has finished reading and hand back the transmit slots it has rewritten. Doing it here is what
+    // lets the steady-state pump run without a single external method call — the round trip that
+    // used to carry these was the last per-tick IPC. Done BEFORE the scans below so this interrupt
+    // already reflects the work.
+    {
+        struct UFOhciControl* c =
+            (struct UFOhciControl*)((uint8_t*)v->status + kUFOhciControlOffset);
+        const uint64_t rel = c->releaseUpTo, fill = c->txFillUpTo;
+        if (rel) uf_iso_release(v, rel);
+        if (fill) uf_it_refill(v, fill);
+    }
+
+    if (v->isoRunning && v->isoContinuous) {
+        struct ohci_descriptor* d = (struct ohci_descriptor*)v->isoDescCPU;
+        const uint32_t n = v->isoPackets;
+        while (v->isoWriteCursor - v->isoReadCursor < n) {
+            const uint32_t i = (uint32_t)(v->isoWriteCursor % n);
+            if (d[i].transfer_status == 0) break;      // controller hasn't filled this slot yet
+            ++v->isoWriteCursor;
+        }
+    }
+    if (v->itRunning) {
+        struct ohci_descriptor* d = (struct ohci_descriptor*)v->itDescCPU;
+        while (v->itSentCursor < v->itFillCursor) {
+            const uint32_t i = (uint32_t)(v->itSentCursor % kITPackets);
+            if (uf::is_full_packet(i, v->itFullCount, kITPackets) &&
+                d[i * 4 + 2].transfer_status == 0)
+                break;
+            ++v->itSentCursor;
+        }
+    }
+
+    // Seqlock publish: odd while writing, even when the payload is coherent.
+    struct UFOhciStatus* s = v->status;
+    s->seq = s->seq + 1;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s->irqCount    = ++v->isoIrqCount;
+    s->rxCompleted = v->isoWriteCursor;
+    s->txSent      = v->itSentCursor;
+    s->hostTime    = host;
+    s->cycleTimer  = cycle;
+    s->irqEvery    = v->isoIrqEvery;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s->seq = s->seq + 1;
+
+    // Wake the pump. The message is only an edge — everything it needs is in the status page above,
+    // so the daemon never has to decode the async payload on its realtime thread.
+    if (v->wakeClient && v->wakeAction) {
+        uint64_t data[1] = { v->isoIrqCount };
+        v->wakeClient->AsyncCompletion(v->wakeAction, kIOReturnSuccess, data, 1);
+    }
+}
+
+kern_return_t UFFireWireOHCI::CopyStatusBuffer(IOMemoryDescriptor** memory)
+{
+    if (!ivars->statusBuf) return kIOReturnNotReady;
+    ivars->statusBuf->retain();
+    *memory = ivars->statusBuf;
+    return kIOReturnSuccess;
+}
+
+// The daemon's standing subscription to the completion interrupt. One client at a time; a second
+// subscribe replaces the first, which is what a daemon restart looks like from here.
+kern_return_t UFFireWireOHCI::SetIsoWake(IOUserClient* client, OSAction* action)
+{
+    OSSafeReleaseNULL(ivars->wakeAction);
+    OSSafeReleaseNULL(ivars->wakeClient);
+    if (action) action->retain();
+    if (client) client->retain();
+    ivars->wakeAction = action;
+    ivars->wakeClient = client;
+    os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: iso wake %s", action ? "subscribed" : "cleared");
+    return kIOReturnSuccess;
+}
 
 kern_return_t UFFireWireOHCI::IsoTxStart(uint32_t channel, uint32_t fullPayloadBytes, uint32_t fullCount)
 {
@@ -1157,7 +1349,12 @@ kern_return_t UFFireWireOHCI::IsoTxStart(uint32_t channel, uint32_t fullPayloadB
     reg_write(ivars->pci, ivars->barIndex, OHCI_IsoXmitIntEventClear, 1u << kITContext);
     reg_write(ivars->pci, ivars->barIndex, CTX_COMMAND_PTR(base), (uint32_t)ivars->itDescAddr | 3);
     reg_write(ivars->pci, ivars->barIndex, CTX_CONTROL_SET(base), CTX_RUN);
-    ivars->itRunning = true;
+    ivars->itRunning    = true;
+    ivars->itFullCount  = fullCount;
+    // The whole ring starts filled (with silence) and status-cleared by the memset above, so the
+    // daemon's fill cursor starts one full lap ahead of the transmit head. See IsoTxSent.
+    ivars->itSentCursor = 0;
+    ivars->itFillCursor = kITPackets;
 
     // Health check (no sleeps — this is on the start path). run(0x8000)/active(0x400)/DEAD(0x800) and
     // evt = ctl & 0x1f. DEAD with evt 0x6 (evt_descriptor_read) means a bad descriptor address; that
@@ -1170,6 +1367,75 @@ kern_return_t UFFireWireOHCI::IsoTxStart(uint32_t channel, uint32_t fullPayloadB
 
     os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: iso TX started, channel %u, %u B/full packet, %u/%u full",
            channel, fullPayloadBytes, fullCount, kITPackets);
+    return kIOReturnSuccess;
+}
+
+// ── Transmit pacing: where the controller actually is in the ring ─────────────────────────────
+// The IT ring self-loops forever — unlike capture, the controller never waits for us, so a daemon
+// that fills at its own pace eventually walks into the transmit head and the audio tears. These two
+// calls are the transmit mirror of IsoCompletedCount/IsoRelease and let the daemon hold a fixed lead.
+//
+// Each packet's OUTPUT_LAST descriptor carries DESCRIPTOR_STATUS, so the controller writes a
+// non-zero transfer_status once the packet is on the wire; ohci.c handle_it_packet polls exactly
+// this field. The daemon clears it again as it refills the slot, which is what makes the *next* lap
+// detectable — a status that we have not cleared is stale and says nothing about this lap, hence the
+// scan never runs past the fill cursor.
+//
+// Invariant: itSentCursor <= itFillCursor <= itSentCursor + kITPackets, and the difference is the
+// lead in packets (125 us each). Both start one lap apart because IsoTxStart leaves the entire ring
+// filled with silence and status-cleared.
+kern_return_t UFFireWireOHCI::IsoTxSent(uint64_t* sent)
+{
+    if (!ivars->itRunning) { *sent = 0; return kIOReturnNotReady; }
+    struct ohci_descriptor* d = (struct ohci_descriptor*)ivars->itDescCPU;
+    while (ivars->itSentCursor < ivars->itFillCursor) {
+        const uint32_t i = (uint32_t)(ivars->itSentCursor % kITPackets);
+        // Empty (0-byte) packets are counted as gone without consulting their status: whether the
+        // controller writes a status back for a zero-length OUTPUT_LAST is not worth depending on,
+        // and the following full packet pins the cursor anyway (so this overshoots by at most one).
+        if (uf::is_full_packet(i, ivars->itFullCount, kITPackets) &&
+            d[i * 4 + 2].transfer_status == 0)
+            break;
+        ++ivars->itSentCursor;
+    }
+    *sent = ivars->itSentCursor;
+    return kIOReturnSuccess;
+}
+
+// The daemon has written payload into every slot below `upTo`; clear those descriptors' status so
+// the next lap's transmit is visible. Clamped to one ring lap ahead of the transmit head.
+static void uf_it_refill(UFFireWireOHCI_IVars* v, uint64_t upTo)
+{
+    if (!v->itRunning) return;
+    struct ohci_descriptor* d = (struct ohci_descriptor*)v->itDescCPU;
+    while (v->itFillCursor < upTo &&
+           v->itFillCursor - v->itSentCursor < kITPackets) {
+        const uint32_t i = (uint32_t)(v->itFillCursor % kITPackets);
+        d[i * 4 + 2].transfer_status = 0;
+        ++v->itFillCursor;
+    }
+}
+
+kern_return_t UFFireWireOHCI::IsoTxRefill(uint64_t upTo)
+{
+    if (!ivars->itRunning) return kIOReturnNotReady;
+    uf_it_refill(ivars, upTo);
+    return kIOReturnSuccess;
+}
+
+// Clock servo: change one slot's transmitted payload size. Both the DMA length (b[2].req_count) and
+// the isochronous header's data-length field (hdr[1]) must agree, or the controller emits a packet
+// whose header and payload disagree. Only the daemon's own frame geometry decides the byte count; the
+// dext just writes it. Safe because the daemon only ever calls this for a slot behind the transmit
+// head (one it is refilling), exactly like IsoTxRefill.
+kern_return_t UFFireWireOHCI::IsoTxSetSlotBytes(uint32_t slot, uint32_t payloadBytes)
+{
+    if (!ivars->itRunning) return kIOReturnNotReady;
+    if (slot >= kITPackets || payloadBytes > kUFOhciTxSlotBytes) return kIOReturnBadArgument;
+    struct ohci_descriptor* d = (struct ohci_descriptor*)ivars->itDescCPU;
+    struct ohci_descriptor* b = &d[slot * 4];
+    b[2].req_count = (uint16_t)payloadBytes;
+    ((uint32_t*)&b[1])[1] = IT_HDR_Q1(payloadBytes);   // hdr[1] = length << 16
     return kIOReturnSuccess;
 }
 
@@ -1210,6 +1476,38 @@ kern_return_t UFFireWireOHCI::MidiInDisable()
     return kIOReturnSuccess;
 }
 
+// DIAGNOSTIC: log every inbound async request the FF800 (or any peer) sends us — the host-node
+// probe we are trying to detect. Walks the AR-request buffer from a private cursor and os_logs each
+// packet's tcode + source node + 48-bit target address (+ read length). tcodes: 0=wq 1=wb 4=rq 5=rb.
+// Reads of our config-ROM / CSR space are exactly what would gate the device's "host present/green".
+kern_return_t UFFireWireOHCI::DebugPollInbound()
+{
+    struct ohci_descriptor* qd = (struct ohci_descriptor*)ivars->arReqDescCPU;
+    const uint32_t written = kARBufferBytes - qd->res_count;
+    const uint32_t* buf = ivars->arReqCPU;
+    uint32_t off = ivars->dbgArReadBytes;
+    while (off + 16 <= written) {
+        const uint32_t* h = buf + off / 4;
+        const unsigned tcode = (h[0] >> 4) & 0xf;
+        const unsigned src   = h[1] >> 16;
+        const uint64_t addr  = ((uint64_t)(h[1] & 0xffff) << 32) | h[2];
+        unsigned adv = 0, len = 0;
+        switch (tcode) {
+            case 0x0: adv = 16 + 4; break;                              // write quadlet req
+            case 0x1: len = h[3] >> 16; adv = 16 + ((len + 3) & ~3u) + 4; break;  // write block req
+            case 0x4: adv = 12 + 4; break;                              // read quadlet req
+            case 0x5: len = h[3] >> 16; adv = 16 + 4; break;            // read block req (header only)
+            default:  adv = 0; break;
+        }
+        os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: INBOUND tcode=%u src=0x%04x addr=0x%llx len=%u",
+               tcode, src, addr, len);
+        if (adv == 0) { off = written; break; }                       // unknown: skip the rest
+        off += adv;
+    }
+    ivars->dbgArReadBytes = off;
+    return kIOReturnSuccess;
+}
+
 // Drain MIDI bytes received since the last poll. Walks the AR-request buffer from our read cursor to
 // wherever the controller has written (buffer size - res_count), parsing async write requests to our
 // MIDI region and unpacking one byte per quadlet (little-endian, low 8 bits).
@@ -1246,6 +1544,19 @@ kern_return_t UFFireWireOHCI::MidiInPoll(uint8_t* out, uint32_t* outCount)
         }
     }
     ivars->arReqReadBytes = off;
+
+    // Recycle the buffer once the controller has filled it and we have parsed everything in it.
+    // The AR-request context is a SINGLE self-branching descriptor: when res_count reaches 0 the
+    // controller has nowhere left to put incoming requests and simply stops accepting them, and
+    // because nothing ever reset the descriptor, MIDI-in would die permanently after the first 4 KB
+    // of inbound traffic and never come back. Re-arm and wake the context instead.
+    if (qd->res_count == 0 && off >= written) {
+        qd->res_count       = kARBufferBytes;
+        qd->transfer_status = 0;
+        ivars->arReqReadBytes = 0;
+        reg_write(ivars->pci, ivars->barIndex, CTX_CONTROL_SET(OHCI_AR_REQ_BASE), CTX_WAKE);
+    }
+
     *outCount = n;
     return kIOReturnSuccess;
 }

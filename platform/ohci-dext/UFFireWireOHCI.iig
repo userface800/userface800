@@ -13,6 +13,7 @@
 
 #include <DriverKit/IOService.iig>
 #include <DriverKit/IOInterruptDispatchSource.iig>
+#include <DriverKit/IOUserClient.iig>
 
 class UFFireWireOHCI: public IOService
 {
@@ -57,8 +58,26 @@ public:
     // will not start its own transmit stream into silence.
     virtual kern_return_t IsoTxStart(uint32_t channel, uint32_t fullPayloadBytes, uint32_t fullCount) LOCALONLY;
     virtual kern_return_t IsoTxStop() LOCALONLY;
+    // Transmit pacing: IsoTxSent reports how many packets the controller has put on the wire, so the
+    // daemon can fill the ring at a fixed lead ahead of the transmit head instead of free-running;
+    // IsoTxRefill(n) hands back the slots it has rewritten. HARDWARE-GATED.
+    virtual kern_return_t IsoTxSent(uint64_t * sent) LOCALONLY;
+    virtual kern_return_t IsoTxRefill(uint64_t upTo) LOCALONLY;
+    // Clock servo: resize one transmit slot's payload (the daemon sprinkles 7-frame packets among
+    // the 6-frame ones so the long-term average matches the device's true rate). Only safe on a slot
+    // behind the transmit head — the daemon calls it while filling, same as IsoTxRefill. HARDWARE-GATED.
+    virtual kern_return_t IsoTxSetSlotBytes(uint32_t slot, uint32_t payloadBytes) LOCALONLY;
+    // DIAGNOSTIC: log inbound async requests from the FF800 (host-node probe detection). HARDWARE-GATED.
+    virtual kern_return_t DebugPollInbound() LOCALONLY;
     virtual kern_return_t CopyIsoBuffer(IOMemoryDescriptor ** memory) LOCALONLY;
     virtual kern_return_t CopyTxBuffer(IOMemoryDescriptor ** memory) LOCALONLY;
+    virtual kern_return_t CopyStatusBuffer(IOMemoryDescriptor ** memory) LOCALONLY;
+
+    // Interrupt-driven pump: the daemon subscribes once (async external method) and the isochronous
+    // receive completion interrupt then wakes it, instead of it polling on a 1 ms timer. The user
+    // client hands us both itself and the client's completion action, because AsyncCompletion() is
+    // an IOUserClient method and the interrupt fires on the driver.
+    virtual kern_return_t SetIsoWake(IOUserClient * client, OSAction * action) LOCALONLY;
 
     // Read the OHCI isochronous cycle timer (the bus clock) — the ISOCH_QUERY_CYCLE_TIME equivalent.
     virtual kern_return_t ReadCycleTimer(uint32_t * value) LOCALONLY;

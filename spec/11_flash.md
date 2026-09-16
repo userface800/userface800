@@ -33,6 +33,7 @@ FFADO retries up to 25× with a per-iteration delay (500 ms after erase, 5 ms af
 ## 11.4 Status & plan
 - `tools/uf-flash.cpp` implements **read** (`rev`, `read`, `dump-settings`, `dump-mixer`) and a guarded
   **erase-settings** (`--force`). Read is safe; erase/write are DESTRUCTIVE + hardware-gated.
-- **The settings-record LAYOUT is unknown** (`[?]`). Do NOT write a "store my settings" until the
-  layout is known; read is safe, write is not.
+- **The settings-record layout** is FFADO's `FF_device_flash_settings_t`, which mirrors the flash
+  exactly. A write ("store my settings") is feasible from that layout, but it is unverified against
+  the device `[?]`; read-first remains the safe path.
 - Confirm on hardware, then promote §11.1/11.3 to `[HW-CONFIRMED]`.

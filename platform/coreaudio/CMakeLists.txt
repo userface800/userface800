@@ -12,6 +12,8 @@ set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(libASPL)
 
 add_library(UFAudioDriver MODULE UFAudioDriver.cpp)
+# The portable core, for the channel map / channel names shared with the daemon and the CLI tools.
+target_include_directories(UFAudioDriver PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
 target_link_libraries(UFAudioDriver PRIVATE libASPL "-framework CoreFoundation" "-framework CoreAudio")
 
 # Assemble the loadable bundle layout by hand (a MODULE library is just the executable).
