@@ -1,6 +1,6 @@
 // The zero-timestamp clock's safety invariants. These exist because a bad (sampleTime, hostTime)
 // pair does not degrade gracefully: the HAL extrapolates every IO wake-up from it, so an anchor that
-// stops advancing makes coreaudiod run IO cycles back to back and peg a core (hung the
+// stops advancing makes coreaudiod run IO cycles back to back and peg a core (it hung the
 // machine, and survived `killall coreaudiod` because the restarted daemon re-mapped the same stale
 // ring). That takes the whole system with it, so the invariants are proven here,
 // headless, before the bundle is installed.
@@ -19,6 +19,15 @@ static constexpr uint64_t kPeriodTicks   = (uint64_t)(kTicksPerFrame * kPeriod);
 // Ticks are nanoseconds here, so ticksPerSecond is 1e9.
 static ZeroTimeStampClock make() { return ZeroTimeStampClock(kPeriod, kTicksPerFrame, 1.0e9); }
 static const uint64_t kStaleTicks = ZeroTimeStampClock(kPeriod, kTicksPerFrame, 1.0e9).staleTicks();
+
+// The real anchor interval is a fixed FRAME count, so its duration changes with the rate — 42.7 ms
+// at 48 kHz, 10.7 ms at 192 kHz. The staleness window has to cover it at BOTH ends: too small and
+// the clock unlocks on every anchor at low rates, too large and a dead daemon goes unnoticed for
+// longer than it should. These are the rates and the period the driver actually ships.
+static constexpr uint32_t kRealAnchor = 2048;
+static ZeroTimeStampClock makeAt(double rate) {
+    return ZeroTimeStampClock(kRealAnchor, 1.0e9 / rate, 1.0e9);
+}
 
 // Every invariant, checked over a whole sequence, so no test has to remember to assert them all.
 struct Invariants {
@@ -207,6 +216,66 @@ UF_TEST(adversarial_input_sequence_holds_every_invariant) {
             case 5: devHost = now + (rand() % 10'000'000'000ull); break;// host in the future
         }
         inv.feed(c.next(now, (rand() & 3) != 0, devSample, devHost), now);
+    }
+}
+
+// ── the shipping anchor interval, at both ends of the rate range ──────────────────────────────
+
+UF_TEST(anchors_at_the_real_interval_never_unlock) {
+    // A daemon publishing exactly on time, one anchor per period, must never drop the lock. This is
+    // the case an earlier version got wrong: the window was a fixed duration that did not account
+    // for the interval, so at 48 kHz — where one interval is already 42.7 ms — every anchor looked
+    // overdue and the clock unlocked continuously.
+    for (double rate : {48000.0, 96000.0, 192000.0}) {
+        auto c = makeAt(rate);
+        Invariants inv;
+        const uint64_t interval = (uint64_t)(kRealAnchor * 1.0e9 / rate);   // ns
+        uint64_t devHost = 1'000'000'000;
+        double devSample = 0;
+        for (int p = 0; p < 300; ++p) {
+            // The HAL asks several times per interval; the anchor only moves once.
+            for (int k = 0; k < 4; ++k) {
+                const uint64_t now = devHost + k * (interval / 4);
+                inv.feed(c.next(now, true, devSample, devHost), now);
+            }
+            devSample += kRealAnchor;
+            devHost   += interval;
+        }
+        if (!c.locked()) UF_FAIL("unlocked while anchors arrived exactly on schedule");
+        UF_CHECK_EQ(inv.seedMoves, 0u);      // no discontinuity the HAL could see
+    }
+}
+
+UF_TEST(a_late_anchor_within_the_margin_is_tolerated) {
+    // One interval of jitter on top of the interval itself must still be fine — that is what the
+    // fixed margin buys, and DAW load routinely costs that much.
+    auto c = makeAt(48000.0);
+    const uint64_t interval = (uint64_t)(kRealAnchor * 1.0e9 / 48000.0);
+    uint64_t devHost = 1'000'000'000;
+    double devSample = 0;
+    for (int p = 0; p < 50; ++p) {
+        c.next(devHost, true, devSample, devHost);
+        devSample += kRealAnchor;
+        devHost += interval + (p == 25 ? 30'000'000ull : 0);   // one 30 ms hiccup
+    }
+    UF_CHECK(c.locked());
+}
+
+UF_TEST(a_dead_daemon_is_still_noticed_at_every_rate) {
+    // The window must not have grown so far that a stopped publisher goes unseen. Whatever the rate,
+    // a frozen anchor has to be abandoned and the timeline keep moving — that is the anti-spin
+    // guarantee, and widening the window for the anchor interval must not have cost it.
+    for (double rate : {48000.0, 192000.0}) {
+        auto c = makeAt(rate);
+        const uint64_t t0 = 1'000'000'000;
+        c.next(t0, true, 0, t0);
+        double last = 0;
+        for (uint64_t now = t0; now < t0 + 3'000'000'000ull; now += 5'000'000ull) {
+            auto s = c.next(now, true, 0, t0);      // anchor never moves again
+            last = s.sampleTime;
+        }
+        if (c.locked()) UF_FAIL("still locked to an anchor frozen for three seconds");
+        if (!(last > 0)) UF_FAIL("timeline stalled instead of free-running");
     }
 }
 

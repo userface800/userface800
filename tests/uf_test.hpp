@@ -1,6 +1,6 @@
 // uf_test.hpp — a tiny, dependency-free unit-test harness for the portable core.
 //
-// Rationale: the portable protocol core must be testable on Linux with no
+// Rationale: the portable protocol core must be testable on any platform with no
 // network fetches (Catch2/GoogleTest). This header gives just enough: self-registering test
 // cases, a handful of CHECK macros, and a main() that runs all tests and reports a summary.
 // One test executable per module links this header + its own translation unit.

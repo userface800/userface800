@@ -21,9 +21,24 @@ inline constexpr uint32_t kBytesPerSample = 4;             // int32 in the ring 
 inline constexpr uint32_t kSlotFrameBytes = kMaxChannels * kBytesPerSample;
 inline constexpr uint32_t kSlotBytes    = kFramesPerSlot * kSlotFrameBytes;
 inline constexpr uint32_t kSlots        = 8;               // power of two
+
+// Frames between clock anchors — the device's ZeroTimeStampPeriod, and the interval at which the
+// daemon publishes {sampleTime, hostTime}. BOTH sides must use this: the plugin quantises sample
+// times to it, so if the daemon publishes on a different boundary the host time in each pair belongs
+// to a different instant than the sample count and the HAL's rate estimate wanders.
+//
+// It also sets the largest IO buffer a DAW can choose. Measured on macOS: the HAL caps the buffer at
+// **ZeroTimeStampPeriod * 3/8** (512 -> 192, 2048 -> 768, and Loopback Audio's 3072 implies 8192),
+// limited to 4096. At 512 the ceiling was 192 frames, which is 1 ms at 192 kHz and audibly too tight;
+// 2048 puts 512-frame buffers within reach at every rate.
+//
+// Deliberately independent of kFramesPerSlot, which it used to share. They answer different
+// questions — one is how much audio a ring slot holds, the other how often the clock is stamped —
+// and tying them together is why the buffer ceiling was stuck.
+inline constexpr uint32_t kAnchorFrames = 2048;
 static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be a power of two");
 
-inline constexpr uint32_t kMagic   = 0x55465231;           // "UFR1"
+inline constexpr uint32_t kMagic   = 0x55465233;           // "UFR3" — bumped when the HAL clock telemetry was added
 inline constexpr char     kCaptureName[]  = "/userface800.capture";
 inline constexpr char     kPlaybackName[] = "/userface800.playback";
 
@@ -38,6 +53,16 @@ struct Slot {
 struct Ring {
     uint32_t magic;
     uint32_t slots;
+    // Which daemon run created this ring. The plugin uses it to notice that the daemon restarted and
+    // that its mapping is now an orphan.
+    //
+    // It has to live in the ring because macOS gives POSIX shared memory no usable identity from the
+    // outside: fstat() on an shm fd returns st_dev=0 and st_ino=0 for every object, always. An
+    // identity check built on those — which is the obvious thing, and works on Linux — compares equal
+    // to itself forever and never detects anything. That silently disables re-attach entirely: the
+    // plugin keeps writing into a ring nobody reads, which does not present as "no sound" but as
+    // damaged audio and a crawling transport.
+    uint64_t instance;
     uint32_t framesPerSlot;
     uint32_t channelCount;
     alignas(kCacheLine) std::atomic<uint64_t> head;        // producer cursor
@@ -79,10 +104,20 @@ struct Ring {
     std::atomic<uint32_t> requestedClockSource;              // plugin -> daemon
     std::atomic<uint64_t> controlSeq;                        // plugin -> daemon: bumps per request
 
+    // HAL clock telemetry, plugin -> daemon, diagnostics only. coreaudiod writes nothing to the
+    // unified log (verified: zero lines from it at any level), so os_log from the
+    // plugin is unreadable. The daemon's stdout is the only channel we can actually see, and it
+    // already shares this mapping — so the plugin publishes its clock state here and the daemon
+    // prints it, letting an audible glitch be lined up against a clock re-lock.
+    alignas(kCacheLine) std::atomic<uint32_t> halLocked;    // 1 = following the device clock
+    std::atomic<uint32_t> halUnlocks;                       // times it has LOST lock
+    std::atomic<uint64_t> halSeed;                          // discontinuity seed handed to CoreAudio
+
     alignas(kCacheLine) Slot slot[kSlots];
 
-    void init() noexcept {
+    void init(uint64_t instanceId) noexcept {
         magic = kMagic; slots = kSlots; framesPerSlot = kFramesPerSlot; channelCount = kMaxChannels;
+        instance = instanceId;
         head.store(0, std::memory_order_relaxed);
         tail.store(0, std::memory_order_relaxed);
         overruns.store(0, std::memory_order_relaxed);
@@ -97,6 +132,9 @@ struct Ring {
         clockLocked.store(0, std::memory_order_relaxed);
         requestedClockSource.store(0, std::memory_order_relaxed);
         controlSeq.store(0, std::memory_order_relaxed);
+        halLocked.store(0, std::memory_order_relaxed);
+        halUnlocks.store(0, std::memory_order_relaxed);
+        halSeed.store(0, std::memory_order_relaxed);
     }
 
     // Producer (daemon) publishes the device-paced clock anchor. seed brackets the write.

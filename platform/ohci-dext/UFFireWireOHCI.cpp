@@ -150,15 +150,46 @@ struct UFFireWireOHCI_IVars {
     bool                       midiInOn;
     uint32_t                   arReqReadBytes; // how far we have parsed the AR-request buffer
     uint32_t                   dbgArReadBytes; // DIAGNOSTIC: separate cursor for the inbound-request logger
+
+    // Power management. `started` says Start() has finished, so the buffers uf_hw_bring_up() reads
+    // out of ivars actually exist. `wasPoweredDown` distinguishes a WAKE from the initial power-on:
+    // only a wake needs the controller rebuilt, because the initial one is Start()'s own job.
+    bool                       started;
+    bool                       wasPoweredDown;
 };
 
+// ── The sleep gate ────────────────────────────────────────────────────────────────────────────
+// macOS powers the Thunderbolt/PCIe bridge down when the system sleeps. Touching a BAR whose device
+// has gone away is a PCIe bus error, and on Apple Silicon that is an immediate kernel panic — not an
+// error return, not a 0xffffffff read. It is how this driver killed the machine twice on lid close:
+// the faulting read was OHCI_IntEventClear (0x084), the first register InterruptOccurred reads.
+//
+// The gate lives in the two accessors below rather than in the handful of paths anyone thought to
+// check, because EVERY MMIO access in this driver funnels through them. That matters: the interrupt
+// handler is only one offender. The daemon polls IsoTxSent/IsoTxRefill hundreds of times a second
+// through the user client, on a different thread, and each of those reads registers too — gating
+// only the interrupt would have left the far busier path still able to panic the machine.
+//
+// Relaxed atomics are enough. The flag goes false in SetPowerState(Off), which the system calls
+// BEFORE it cuts power, and true in SetPowerState(On) after power is back — so a racing reader that
+// sees a stale `true` is still talking to a device that is genuinely powered. What must never happen
+// is a reader seeing a stale `true` *after* power is gone, and the SetPowerState ordering below
+// (quiesce on the interrupt queue, then return) is what rules that out.
+static bool g_powered = true;
+static inline bool ohci_powered(void)  { return __atomic_load_n(&g_powered, __ATOMIC_RELAXED); }
+static inline void ohci_set_powered(bool on) { __atomic_store_n(&g_powered, on, __ATOMIC_RELAXED); }
+
 // ── Register access (OHCI BAR0 MMIO) — reg_read/reg_write equivalents ─────────────────────────
+// A read while powered down returns all-ones, which is what a real absent device reads as, so
+// callers that already treat 0xffffffff as "not there" (InterruptOccurred does) behave sensibly.
 static inline uint32_t reg_read(IOPCIDevice* pci, uint8_t bar, uint32_t off) {
+    if (!ohci_powered()) return 0xffffffffu;
     uint32_t v = 0;
     pci->MemoryRead32(bar, off, &v);
     return v;
 }
 static inline void reg_write(IOPCIDevice* pci, uint8_t bar, uint32_t off, uint32_t v) {
+    if (!ohci_powered()) return;
     pci->MemoryWrite32(bar, off, v);
 }
 
@@ -257,7 +288,9 @@ static kern_return_t phy_write(IOPCIDevice* pci, uint8_t bar, uint8_t addr, uint
 {
     reg_write(pci, bar, OHCI_PhyControl, PhyControl_Write(addr, data));
     for (int i = 0; i < 100; ++i) {
-        if (!(reg_read(pci, bar, OHCI_PhyControl) & PhyControl_WritePending)) return kIOReturnSuccess;
+        const uint32_t val = reg_read(pci, bar, OHCI_PhyControl);
+        if (val == 0xffffffff) return kIOReturnNoDevice;   // gated (asleep) or ejected
+        if (!(val & PhyControl_WritePending)) return kIOReturnSuccess;
         IOSleep(1);
     }
     return kIOReturnTimeout;
@@ -274,6 +307,147 @@ static kern_return_t software_reset(IOPCIDevice* pci, uint8_t bar)
         IOSleep(1);
     }
     return kIOReturnBusy;
+}
+
+// ── Controller bring-up ───────────────────────────────────────────────────────────────────────
+// Every register the controller needs to be a working 1394 node, and nothing else. It reads the
+// buffer addresses out of ivars but allocates nothing, which is exactly what makes it callable
+// twice: once from Start() after the allocations, and again from SetPowerState(On) after sleep has
+// wiped the controller clean while leaving our memory and DMA mappings perfectly valid.
+//
+// Sleep takes the lot — link, self-ID buffer address, interrupt masks, request filters, config ROM,
+// PHY state and every DMA context — so this replays all of it rather than trying to guess what
+// survived. It is idempotent: a soft reset is the first thing it does.
+//
+// The AR descriptors are rewritten each time, not just re-pointed. The controller writes status
+// back into them as it consumes packets, so the copies in memory are dirty from the previous life.
+static kern_return_t uf_hw_bring_up(UFFireWireOHCI_IVars* v)
+{
+    // D3->D0 can clear these, and without them every access below is a bus error.
+    uint16_t cmd = 0;
+    v->pci->ConfigurationRead16(0x04, &cmd);
+    v->pci->ConfigurationWrite16(0x04, cmd | 0x0006);   // Memory Space | Bus Master
+
+    kern_return_t ret = software_reset(v->pci, v->barIndex);
+    if (ret != kIOReturnSuccess) { os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: reset failed"); return ret; }
+
+    // Enable LPS + posted writes; wait for Link Power Status to come up (ohci.c: 50 ms x3).
+    reg_write(v->pci, v->barIndex, OHCI_HCControlSet, HCControl_LPS | HCControl_postedWriteEnable);
+    uint32_t lps = 0;
+    for (int i = 0; i < 3 && !lps; ++i) {
+        IOSleep(50);
+        lps = reg_read(v->pci, v->barIndex, OHCI_HCControlSet) & HCControl_LPS;
+    }
+    if (!lps) { os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: LPS never set"); return kIOReturnIOError; }
+
+    // Keep quadlet data in bus order (no controller byte-swap), matching ohci.c.
+    reg_write(v->pci, v->barIndex, OHCI_HCControlClear, HCControl_noByteSwapData);
+
+    reg_write(v->pci, v->barIndex, OHCI_SelfIDBuffer, (uint32_t)v->selfIdDeviceAddr);
+
+    // Link control: enable self-ID + phy-packet receive, cycle timer/master (ohci.c).
+    reg_write(v->pci, v->barIndex, OHCI_LinkControlSet,
+              LinkControl_rcvSelfID | LinkControl_rcvPhyPkt |
+              LinkControl_cycleTimerEnable | LinkControl_cycleMaster);
+    reg_write(v->pci, v->barIndex, OHCI_ATRetries, OHCI_ATRetries_value);
+
+    reg_write(v->pci, v->barIndex, OHCI_IntEventClear, ~0u);
+    reg_write(v->pci, v->barIndex, OHCI_IntMaskClear, ~0u);
+
+    // AR response context: one INPUT_MORE|STATUS descriptor branching to itself.
+    if (v->arDescCPU) {
+        struct ohci_descriptor* ard = (struct ohci_descriptor*)v->arDescCPU;
+        ard->req_count      = kARBufferBytes;
+        ard->control        = (uint16_t)(DESC_INPUT_MORE | DESC_STATUS | DESC_BRANCH_ALWAYS);
+        ard->data_address   = (uint32_t)v->arAddr;
+        ard->branch_address = (uint32_t)v->arDescAddr | 1;   // loop to self, Z=1
+        ard->res_count = 0; ard->transfer_status = 0;
+        reg_write(v->pci, v->barIndex, CTX_COMMAND_PTR(OHCI_AR_RSP_BASE),
+                  (uint32_t)v->arDescAddr | 1);
+        reg_write(v->pci, v->barIndex, CTX_CONTROL_SET(OHCI_AR_RSP_BASE), CTX_RUN);
+    }
+    // AR request context: same shape, for inbound requests (the FF800 probing us).
+    if (v->arReqDescCPU) {
+        struct ohci_descriptor* qd = (struct ohci_descriptor*)v->arReqDescCPU;
+        qd->req_count      = kARBufferBytes;
+        qd->control        = (uint16_t)(DESC_INPUT_MORE | DESC_STATUS | DESC_BRANCH_ALWAYS);
+        qd->data_address   = (uint32_t)v->arReqAddr;
+        qd->branch_address = (uint32_t)v->arReqDescAddr | 1;
+        qd->res_count = 0; qd->transfer_status = 0;
+        v->arReqReadBytes = 0; v->dbgArReadBytes = 0;
+        reg_write(v->pci, v->barIndex, CTX_COMMAND_PTR(OHCI_AR_REQ_BASE),
+                  (uint32_t)v->arReqDescAddr | 1);
+        reg_write(v->pci, v->barIndex, CTX_CONTROL_SET(OHCI_AR_REQ_BASE), CTX_RUN);
+    }
+
+    // Our self-ID must advertise a link layer (and that we can contend for IRM). Without link_active
+    // the bus manager reads us as link-off, decides the root is unusable and force-roots someone else
+    // with a PHY config packet + bus reset — a reset storm our transmits then die in.
+    uint8_t phy4 = 0;
+    if (phy_read(v->pci, v->barIndex, PHY_REG_SELF_ID, &phy4) == kIOReturnSuccess)
+        phy_write(v->pci, v->barIndex, PHY_REG_SELF_ID,
+                  (uint8_t)(phy4 | PHY_LINK_ACTIVE | PHY_CONTENDER));
+
+    // Republish the config ROM. See Start()'s original comment for why every block carries a CRC and
+    // why max_rom=2 matters; the GUID is re-read from the controller rather than cached, because it
+    // is a hardware register and survives the reset either way.
+    if (v->romCPU) {
+        const uint32_t guidHi = reg_read(v->pci, v->barIndex, OHCI_GUID_Hi);
+        const uint32_t guidLo = reg_read(v->pci, v->barIndex, OHCI_GUID_Lo);
+        uint32_t busOptions = reg_read(v->pci, v->barIndex, OHCI_BusOptions);
+        busOptions |=  (1u << 30) | (1u << 29) | (2u << 8);   // cmc | isc | max_rom=2
+        busOptions &= ~((1u << 31) | (1u << 28));             // irmc | bmc off
+
+        uint32_t rom[7];
+        rom[1] = 0x31333934;               // "1394"
+        rom[2] = busOptions;
+        rom[3] = guidHi;
+        rom[4] = guidLo;
+        const uint16_t bibCrc = uf_rom_crc16(&rom[1], 4);
+        rom[0] = (4u << 24) | (4u << 16) | bibCrc;
+        rom[6] = 0x0c0083c0;               // Node_Capabilities (immediate root-dir entry)
+        const uint16_t rootCrc = uf_rom_crc16(&rom[6], 1);
+        rom[5] = (1u << 16) | rootCrc;
+        v->romHeader = rom[0];
+        for (unsigned i = 0; i < 7; ++i) v->romCPU[i] = __builtin_bswap32(rom[i]);
+
+        // ohci.c writes a zero header until self-ID completes, so a peer never reads a ROM that is
+        // about to change generation underneath it.
+        reg_write(v->pci, v->barIndex, OHCI_ConfigROMhdr, 0);
+        reg_write(v->pci, v->barIndex, OHCI_BusOptions, busOptions);
+        reg_write(v->pci, v->barIndex, OHCI_ConfigROMmap, (uint32_t)v->romAddr);
+    }
+
+    reg_write(v->pci, v->barIndex, OHCI_FairnessControl, 0);
+    reg_write(v->pci, v->barIndex, OHCI_PhyUpperBound, 0x00010000);
+
+    // Accept asynchronous requests from every node — after the soft reset this filter is all zeros,
+    // so the link silently drops every inbound request (including reads of the ROM we just built).
+    reg_write(v->pci, v->barIndex, OHCI_AsReqFilterHiSet, 0x80000000);
+
+    // Enable the interrupts we handle + master enable, then bring the link up. isochRx is what makes
+    // the daemon's pump interrupt-driven rather than a 1 ms poll; isochTx is enabled only so a stray
+    // transmit completion gets acknowledged.
+    reg_write(v->pci, v->barIndex, OHCI_IntMaskSet,
+              Int_busReset | Int_selfIDComplete | Int_postedWriteErr | Int_regAccessFail |
+              Int_unrecoverableError | Int_cycleTooLong | Int_isochRx | Int_isochTx |
+              Int_masterEnable);
+    reg_write(v->pci, v->barIndex, OHCI_HCControlSet,
+              HCControl_linkEnable | HCControl_BIBimageValid);
+
+    // Trigger a bus reset so we receive self-IDs. Read-modify-write: PHY reg 1 holds gap_count in its
+    // low 6 bits, so writing a bare IBR would reset our gap count to 0 while the rest of the bus keeps
+    // the default 63 — the two ends then disagree on gap timing and our requests are transmitted but
+    // never acked. A link soft-reset does NOT reset the PHY, so a burned-in gap_count survives.
+    uint8_t phy1 = 0;
+    ret = phy_read(v->pci, v->barIndex, PHY_REG_RESET, &phy1);
+    if (ret != kIOReturnSuccess) {
+        os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: PHY read failed (0x%x)", ret);
+        return ret;
+    }
+    phy_write(v->pci, v->barIndex, PHY_REG_RESET,
+              (uint8_t)((phy1 & ~0x3f) | 0x3f | PHY_IBR));
+    return kIOReturnSuccess;
 }
 
 kern_return_t
@@ -301,22 +475,11 @@ IMPL(UFFireWireOHCI, Start)
     os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: OHCI Version=0x%08x (major %u) GUID=%08x%08x",
            version, (version >> 16) & 0xff, guidHi, guidLo);
 
-    // ── OHCI-1: reset + link bring-up (ohci.c ohci_enable) ────────────────────────────────────
-    ret = software_reset(ivars->pci, ivars->barIndex);
-    if (ret != kIOReturnSuccess) { os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: reset failed"); return ret; }
-
-    // Enable LPS + posted writes; wait for Link Power Status to come up (ohci.c: 50 ms x3).
-    reg_write(ivars->pci, ivars->barIndex, OHCI_HCControlSet,
-              HCControl_LPS | HCControl_postedWriteEnable);
-    uint32_t lps = 0;
-    for (int i = 0; i < 3 && !lps; ++i) {
-        IOSleep(50);
-        lps = reg_read(ivars->pci, ivars->barIndex, OHCI_HCControlSet) & HCControl_LPS;
-    }
-    if (!lps) { os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: LPS never set"); return kIOReturnIOError; }
-
-    // Keep quadlet data in bus order (no controller byte-swap), matching ohci.c.
-    reg_write(ivars->pci, ivars->barIndex, OHCI_HCControlClear, HCControl_noByteSwapData);
+    // ── OHCI-1: allocate first, then program ──────────────────────────────────────────────────
+    // Everything below this point that touches a register now lives in uf_hw_bring_up(), called once
+    // the allocations are done. Allocation touches no controller state, so the order is safe — and
+    // the split is what lets SetPowerState(On) replay the programming after sleep without
+    // reallocating buffers the daemon still has mapped.
 
     // ── Allocate the self-ID receive DMA buffer (2 KB, controller-writable) ───────────────────
     // VERIFY DriverKit signatures against the SDK; this is the standard IOBufferMemoryDescriptor +
@@ -341,18 +504,6 @@ IMPL(UFFireWireOHCI, Start)
                                           &dmaFlags, &segCount, &seg);
     if (ret != kIOReturnSuccess || segCount != 1) return kIOReturnNoMemory;
     ivars->selfIdDeviceAddr = seg.address;
-    reg_write(ivars->pci, ivars->barIndex, OHCI_SelfIDBuffer,
-              static_cast<uint32_t>(ivars->selfIdDeviceAddr));
-
-    // Link control: enable self-ID + phy-packet receive, cycle timer/master (ohci.c).
-    reg_write(ivars->pci, ivars->barIndex, OHCI_LinkControlSet,
-              LinkControl_rcvSelfID | LinkControl_rcvPhyPkt |
-              LinkControl_cycleTimerEnable | LinkControl_cycleMaster);
-    reg_write(ivars->pci, ivars->barIndex, OHCI_ATRetries, OHCI_ATRetries_value);
-
-    // Clear all interrupt state.
-    reg_write(ivars->pci, ivars->barIndex, OHCI_IntEventClear, ~0u);
-    reg_write(ivars->pci, ivars->barIndex, OHCI_IntMaskClear, ~0u);
 
     // The status page the isochronous interrupt publishes into. Plain host memory the client maps —
     // the controller never touches it, so it needs no IODMACommand.
@@ -424,12 +575,7 @@ IMPL(UFFireWireOHCI, Start)
         ivars->arDescDMA->PrepareForDMA(0, ivars->arDescBuf, 0, 64, &f, &n, &s);
         ivars->arDescAddr = s.address;
 
-        struct ohci_descriptor* ard = (struct ohci_descriptor*)ivars->arDescCPU;
-        ard->req_count      = kARBufferBytes;
-        ard->control        = (uint16_t)(DESC_INPUT_MORE | DESC_STATUS | DESC_BRANCH_ALWAYS);
-        ard->data_address   = (uint32_t)ivars->arAddr;
-        ard->branch_address = (uint32_t)ivars->arDescAddr | 1;   // loop to self, Z=1
-        ivars->tlabel = 0;
+        ivars->tlabel = 0;   // the descriptor itself is written by uf_hw_bring_up()
 
         // Isochronous receive buffer: one slot per packet, plus its descriptor ring.
         f = 0; n = 1; s = {};
@@ -502,10 +648,7 @@ IMPL(UFFireWireOHCI, Start)
         if (ret != kIOReturnSuccess || n != 1) return kIOReturnNoMemory;   // contiguous: block i @ i*slot
         ivars->itPayAddr = s.address;
 
-        // Run the AR response context (CommandPtr = descriptor | Z, then RUN).
-        reg_write(ivars->pci, ivars->barIndex, CTX_COMMAND_PTR(OHCI_AR_RSP_BASE),
-                  (uint32_t)ivars->arDescAddr | 1);
-        reg_write(ivars->pci, ivars->barIndex, CTX_CONTROL_SET(OHCI_AR_RSP_BASE), CTX_RUN);
+        // Both AR contexts are described and started by uf_hw_bring_up(), below.
 
         // The AR REQUEST context, same shape. Inbound requests (a peer reading the config ROM we
         // publish) are DMA'd here; without a running context they are dropped no matter what the
@@ -527,33 +670,12 @@ IMPL(UFFireWireOHCI, Start)
         IODMACommand::Create(ivars->pci, 0, &qdspec, &ivars->arReqDescDMA);
         ivars->arReqDescDMA->PrepareForDMA(0, ivars->arReqDescBuf, 0, 64, &f, &n, &s);
         ivars->arReqDescAddr = s.address;
-
-        struct ohci_descriptor* qd = (struct ohci_descriptor*)ivars->arReqDescCPU;
-        qd->req_count      = kARBufferBytes;
-        qd->control        = (uint16_t)(DESC_INPUT_MORE | DESC_STATUS | DESC_BRANCH_ALWAYS);
-        qd->data_address   = (uint32_t)ivars->arReqAddr;
-        qd->branch_address = (uint32_t)ivars->arReqDescAddr | 1;
-
-        reg_write(ivars->pci, ivars->barIndex, CTX_COMMAND_PTR(OHCI_AR_REQ_BASE),
-                  (uint32_t)ivars->arReqDescAddr | 1);
-        reg_write(ivars->pci, ivars->barIndex, CTX_CONTROL_SET(OHCI_AR_REQ_BASE), CTX_RUN);
     }
 
-    // ── Make ourselves a usable node on the bus ───────────────────────────────────────────────
-    // Our self-ID must advertise a link layer (and that we can contend for IRM). Without link_active
-    // the bus manager reads us as link-off, decides the root is unusable and force-roots someone
-    // else with a PHY config packet + bus reset — a reset storm our transmits then die in.
-    uint8_t phy4 = 0;
-    if (phy_read(ivars->pci, ivars->barIndex, PHY_REG_SELF_ID, &phy4) == kIOReturnSuccess) {
-        os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: PHY reg4=0x%02x (link_active=%d contender=%d)",
-               phy4, (phy4 & PHY_LINK_ACTIVE) != 0, (phy4 & PHY_CONTENDER) != 0);
-        phy_write(ivars->pci, ivars->barIndex, PHY_REG_SELF_ID,
-                  (uint8_t)(phy4 | PHY_LINK_ACTIVE | PHY_CONTENDER));
-    }
-
-    // Publish a minimal IEEE-1212 config ROM. The OHCI requires ConfigROMhdr + BusOptions to be
-    // valid BEFORE the link is enabled, and a peer acting as bus manager reads this ROM to decide
-    // whether we are fit to be root. With no ROM it concludes we are not, and resets the bus at us.
+    // ── Allocate the config-ROM buffer; uf_hw_bring_up() fills and publishes it ───────────────
+    // The OHCI requires ConfigROMhdr + BusOptions to be valid BEFORE the link is enabled, and a peer
+    // acting as bus manager reads this ROM to decide whether we are fit to be root. With no ROM it
+    // concludes we are not, and resets the bus at us.
     {
         uint64_t f = 0; uint32_t n = 1; IOAddressSegment sg = {};
         ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, 1024, 16, &ivars->romBuf);
@@ -565,84 +687,15 @@ IMPL(UFFireWireOHCI, Start)
         ret = ivars->romDMA->PrepareForDMA(0, ivars->romBuf, 0, 1024, &f, &n, &sg);
         if (ret != kIOReturnSuccess || n != 1) return kIOReturnNoMemory;
         ivars->romAddr = sg.address;
-
-        // BusOptions: start from what the hardware reports (max_rec, link speed) and declare
-        // ourselves cycle-master + isochronous capable. max_rom = 2 (bits 9:8) is REQUIRED: it tells
-        // peers the ROM is the general (block-readable) format, so the FF800 can block-read the whole
-        // ROM below the bus-info block. Without it a peer only ever quadlet-reads the bus-info block
-        // and never sees the root directory / node capabilities — i.e. we look like a stub node. We
-        // still leave irmc/bmc off: we serve no IRM/BM registers and must not claim to.
-        uint32_t busOptions = reg_read(ivars->pci, ivars->barIndex, OHCI_BusOptions);
-        busOptions |=  (1u << 30) | (1u << 29) | (2u << 8);   // cmc | isc | max_rom=2
-        busOptions &= ~((1u << 31) | (1u << 28));             // irmc | bmc off
-
-        // A COMPLETE IEEE-1212 config ROM matching what a full 1394 stack (IOFireWireFamily / Linux
-        // core-card.c generate_config_rom) publishes for a host node: bus-info block + a root
-        // directory whose single entry is Node_Capabilities (0x0c0083c0, per IEEE 1394 8.3.2.6.5.2).
-        // Every block carries a valid CRC — a reader that verifies CRCs rejects a block whose CRC is
-        // wrong, which is why the old CRC-0 ROM read as invalid. The image is DMA'd out as packet
-        // payload in BUS order (big-endian); only the register writes below take host order.
-        uint32_t rom[7];
-        rom[1] = 0x31333934;               // "1394"
-        rom[2] = busOptions;
-        rom[3] = guidHi;
-        rom[4] = guidLo;
-        const uint16_t bibCrc = uf_rom_crc16(&rom[1], 4);   // bus-info block CRC over quads 1..4
-        rom[0] = (4u << 24) | (4u << 16) | bibCrc;          // info_len=4, crc_len=4, crc
-        rom[6] = 0x0c0083c0;               // Node_Capabilities (immediate root-dir entry)
-        const uint16_t rootCrc = uf_rom_crc16(&rom[6], 1);  // root directory CRC over its 1 entry
-        rom[5] = (1u << 16) | rootCrc;                      // root dir: length 1, crc
-        ivars->romHeader = rom[0];                          // quadlet reads of ROM[0] must carry the CRC too
-        for (unsigned i = 0; i < 7; ++i) ivars->romCPU[i] = __builtin_bswap32(rom[i]);
-
-        // ohci.c writes a zero header until self-ID completes, so a peer never reads a ROM that is
-        // about to change generation underneath it.
-        reg_write(ivars->pci, ivars->barIndex, OHCI_ConfigROMhdr, 0);
-        reg_write(ivars->pci, ivars->barIndex, OHCI_BusOptions, busOptions);
-        reg_write(ivars->pci, ivars->barIndex, OHCI_ConfigROMmap, (uint32_t)ivars->romAddr);
     }
 
-    reg_write(ivars->pci, ivars->barIndex, OHCI_FairnessControl, 0);
-    reg_write(ivars->pci, ivars->barIndex, OHCI_PhyUpperBound, 0x00010000);
+    // ── Everything is allocated: program the controller ───────────────────────────────────────
+    ret = uf_hw_bring_up(ivars);
+    if (ret != kIOReturnSuccess) return ret;
 
-    // Accept asynchronous requests from every node — after the soft reset this filter is all zeros,
-    // so the link silently drops every inbound request (including reads of the ROM we just built).
-    reg_write(ivars->pci, ivars->barIndex, OHCI_AsReqFilterHiSet, 0x80000000);
-
-    // Enable the interrupts we handle + master enable, then bring the link up.
-    //
-    // isochRx is what makes the daemon's pump interrupt-driven rather than a 1 ms poll: the capture
-    // context raises it on descriptors we mark, which are paced by the FF800's own transmit cadence,
-    // so the pump runs on the device's clock instead of a host timer that drifts against it.
-    // isochTx is enabled only so a stray transmit completion gets acknowledged — we deliberately
-    // mark no IT descriptor for interrupt, since capture and transmit ride the same 8 kHz isochronous
-    // cycle and one wake source per cycle is enough for both halves of the pump.
-    reg_write(ivars->pci, ivars->barIndex, OHCI_IntMaskSet,
-              Int_busReset | Int_selfIDComplete | Int_postedWriteErr | Int_regAccessFail |
-              Int_unrecoverableError | Int_cycleTooLong | Int_isochRx | Int_isochTx |
-              Int_masterEnable);
-    reg_write(ivars->pci, ivars->barIndex, OHCI_HCControlSet,
-              HCControl_linkEnable | HCControl_BIBimageValid);
-
-    // Trigger an initial bus reset so we receive self-IDs. Read-modify-write (as ohci_update_phy_reg
-    // does): PHY reg 1 holds gap_count in its low 6 bits, so writing a bare IBR resets our gap count
-    // to 0 while the rest of the bus keeps the default 63 — the two ends then disagree on gap timing
-    // and our requests get transmitted but never acked.
-    uint8_t phy1 = 0;
-    ret = phy_read(ivars->pci, ivars->barIndex, PHY_REG_RESET, &phy1);
-    if (ret != kIOReturnSuccess) {
-        os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: PHY read failed (0x%x)", ret);
-        return ret;
-    }
-    // ...and restore the default gap count while we do. A link soft-reset does NOT reset the PHY, so
-    // a gap_count an earlier driver (or an earlier build of this one) burned in survives, and every
-    // node must agree: ours read 0 against the FF800's 63, which makes the controller see a subaction
-    // gap before the ack arrives (evt_missing_ack). 63 is the post-reset default every node uses; a
-    // bus manager would optimise it downward with a PHY config packet, which we do not implement.
-    os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: PHY reg1=0x%02x (gap_count=%u) -> gap_count=63 + bus reset",
-           phy1, phy1 & 0x3f);
-    phy_write(ivars->pci, ivars->barIndex, PHY_REG_RESET,
-              (uint8_t)((phy1 & ~0x3f) | 0x3f | PHY_IBR));
+    // Only now may SetPowerState touch the hardware: everything it reads out of ivars exists.
+    ivars->started = true;
+    ivars->wasPoweredDown = false;
 
     os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: link enabled; waiting for self-ID (bus reset)");
     RegisterService();
@@ -818,14 +871,16 @@ static unsigned uf_at_header(uint32_t* q, uint32_t tcode, uint8_t tlabel, uint16
 // no-op.
 static void uf_ctx_stop(UFFireWireOHCI_IVars* v, uint32_t base)
 {
-    v->pci->MemoryWrite32(v->barIndex, CTX_CONTROL_CLEAR(base), CTX_RUN);
+    reg_write(v->pci, v->barIndex, CTX_CONTROL_CLEAR(base), CTX_RUN);
     for (int i = 0; i < 100; ++i) {
-        if (!(reg_read(v->pci, v->barIndex, CTX_CONTROL_SET(base)) & CTX_ACTIVE)) break;
+        const uint32_t ctrl = reg_read(v->pci, v->barIndex, CTX_CONTROL_SET(base));
+        if (ctrl == 0xffffffff) return;                    // gated (asleep) or ejected
+        if (!(ctrl & CTX_ACTIVE)) break;
         IOSleep(1);
     }
     // Clear the whole control register, not just RUN: dead + the event code are sticky, and a
     // context left dead can never be revived (ohci.c context_run writes CONTROL_CLEAR = ~0).
-    v->pci->MemoryWrite32(v->barIndex, CTX_CONTROL_CLEAR(base), ~0u);
+    reg_write(v->pci, v->barIndex, CTX_CONTROL_CLEAR(base), ~0u);
 }
 
 // Re-arm the AR response context so the next response lands at the head of arBuf. The context is a
@@ -845,9 +900,9 @@ static void uf_ar_rearm(UFFireWireOHCI_IVars* v)
     ard->data_address    = (uint32_t)v->arAddr;
     ard->branch_address  = (uint32_t)v->arDescAddr | 1;
 
-    v->pci->MemoryWrite32(v->barIndex, CTX_COMMAND_PTR(OHCI_AR_RSP_BASE),
+    reg_write(v->pci, v->barIndex, CTX_COMMAND_PTR(OHCI_AR_RSP_BASE),
                           (uint32_t)v->arDescAddr | 1);
-    v->pci->MemoryWrite32(v->barIndex, CTX_CONTROL_SET(OHCI_AR_RSP_BASE), CTX_RUN);
+    reg_write(v->pci, v->barIndex, CTX_CONTROL_SET(OHCI_AR_RSP_BASE), CTX_RUN);
 }
 
 // Submit the AT block currently in atCPU and wait for the controller to actually send it. Completion
@@ -859,9 +914,9 @@ static kern_return_t uf_at_run(UFFireWireOHCI_IVars* v, unsigned z, unsigned las
     atd[lastIdx].transfer_status = 0;
 
     uf_ctx_stop(v, OHCI_AT_REQ_BASE);
-    v->pci->MemoryWrite32(v->barIndex, CTX_COMMAND_PTR(OHCI_AT_REQ_BASE),
+    reg_write(v->pci, v->barIndex, CTX_COMMAND_PTR(OHCI_AT_REQ_BASE),
                           (uint32_t)v->atAddr | z);
-    v->pci->MemoryWrite32(v->barIndex, CTX_CONTROL_SET(OHCI_AT_REQ_BASE), CTX_RUN);
+    reg_write(v->pci, v->barIndex, CTX_CONTROL_SET(OHCI_AT_REQ_BASE), CTX_RUN);
 
     for (int i = 0; i < 100; ++i) {
         uint32_t ctrl = reg_read(v->pci, v->barIndex, CTX_CONTROL_SET(OHCI_AT_REQ_BASE));
@@ -1651,10 +1706,97 @@ IMPL(UFFireWireOHCI, NewUserClient)
     return kIOReturnSuccess;
 }
 
+// ── System sleep / wake ───────────────────────────────────────────────────────────────────────
+// Why this exists: macOS powers the Thunderbolt/PCIe bridge down on sleep, and touching a BAR whose
+// device has gone away is a PCIe bus error — an immediate kernel panic on Apple Silicon, not an
+// error return. See the sleep gate above reg_read.
+//
+// This handler is on a short leash and every rule below was learned by panicking the machine:
+//
+//   * IT MUST RETURN PROMPTLY. IOServicePM waits ~20 s and then panics the kernel outright.
+//     So the wake-time rebuild — a soft reset, a 150 ms LPS wait, a bus reset, PHY polling — runs
+//     on our own queue via DispatchAsync and this returns immediately.
+//
+//   * NO DispatchSync ONTO ivars->queue. If PM delivers this call on that queue, dispatching
+//     synchronously back onto it deadlocks, which presents as exactly the same PM timeout panic.
+//     Disabling the interrupt source and closing the gate is enough; power is still on until we
+//     return, so an in-flight handler that already passed the gate is reading a live device.
+//
+//   * kIOServicePowerCapabilityOn ALSO ARRIVES AT INITIAL POWER-UP, not just on wake. Treating it
+//     as "we just woke" ran a full bring-up racing Start(), and plugging the adapter in panicked
+//     the machine every single time. wasPoweredDown is what tells the two apart: it is set only on
+//     the way down, so the first power-on — which never had a way down — is left to Start().
+//
+// Never returns failure: a refused power transition is worse than a degraded one, and the daemon
+// already recovers from a dead session through its wedge detection.
+kern_return_t
+IMPL(UFFireWireOHCI, SetPowerState)
+{
+    const bool on = (powerFlags & kIOServicePowerCapabilityOn) != 0;
+    if (!ivars) return SetPowerState(powerFlags, SUPERDISPATCH);
+
+    if (!on) {
+        // Touch NOTHING on the way down.
+        //
+        // The tidy thing — mask interrupts, stop the DMA contexts, drop the link — is what panicked
+        // the machine on the fifth attempt: the faulting write was the AR-response
+        // ContextControlClear (0x1e4), i.e. our own uf_ctx_stop(). By the time this handler runs the
+        // PCIe bridge is ALREADY unreachable, so every one of those courteous writes is a bus error,
+        // which on Apple Silicon is an instant panic.
+        //
+        // There is nothing worth preserving anyway: the controller is losing power, and the wake
+        // path opens with a full soft reset that rebuilds all of it from scratch. So the only thing
+        // that actually has to happen here is that WE stop touching MMIO — which is the gate, and it
+        // closes FIRST so an interrupt handler already in flight reads 0xffffffff and bails out
+        // through the check it already has.
+        ohci_set_powered(false);
+        if (ivars->intSource) ivars->intSource->SetEnable(false);
+        ivars->itRunning = false;
+        ivars->isoRunning = false;
+        ivars->isoContinuous = false;
+        ivars->wasPoweredDown = true;
+        os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: power off — MMIO gated, no register access");
+        return SetPowerState(powerFlags, SUPERDISPATCH);
+    }
+
+    // Open the gate first — everything the rebuild does is register access, and with the gate shut
+    // every write would be silently dropped and we would come back up dead.
+    ohci_set_powered(true);
+
+    if (!ivars->started || !ivars->wasPoweredDown) {
+        // Initial power-on. Start() owns the bring-up; doing it here as well would race it.
+        return SetPowerState(powerFlags, SUPERDISPATCH);
+    }
+    ivars->wasPoweredDown = false;
+
+    // A real wake. Rebuild off the PM thread so this call returns now, not in half a second.
+    if (ivars->pci && ivars->queue) {
+        ivars->queue->DispatchAsync(^{
+            // We may have been queued before another sleep landed. Running now would push every
+            // register write into a closed gate and leave the controller dead, silently.
+            if (!ohci_powered() || !ivars->started) {
+                os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: wake rebuild skipped — powered down again");
+                return;
+            }
+            const kern_return_t ret = uf_hw_bring_up(ivars);
+            if (ret != kIOReturnSuccess) {
+                os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: wake bring-up FAILED (0x%x)", ret);
+                return;
+            }
+            if (ivars->intSource) ivars->intSource->SetEnable(true);
+            os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: wake — controller re-initialised");
+        });
+    }
+    return SetPowerState(powerFlags, SUPERDISPATCH);
+}
+
 kern_return_t
 IMPL(UFFireWireOHCI, Stop)
 {
     if (ivars) {
+        // Shut SetPowerState out first: once we start tearing down, the buffers it would hand the
+        // controller are on their way to being freed.
+        ivars->started = false;
         // Quiesce the controller before we let go of it: no interrupts, no running DMA contexts,
         // link down.
         if (ivars->pci) {

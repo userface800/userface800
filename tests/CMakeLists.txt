@@ -29,5 +29,7 @@ uf_add_test(test_ohci_atblock)
 uf_add_test(test_ohci_configrom)
 
 uf_add_test(test_shm_ring)
+uf_add_test(test_tx_fill)
 uf_add_test(test_zero_timestamp)
 uf_add_test(test_control_plane)
+uf_add_test(test_testsig)

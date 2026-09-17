@@ -36,10 +36,12 @@
 #include "uf/protocol/rate.hpp"
 #include "uf/protocol/settings.hpp"
 #include "uf/protocol/status.hpp"
+#include "uf/protocol/wav.hpp"
 #include "uf/protocol/control.hpp"
 #include "uf/protocol/midi.hpp"
 #include "../shared/uf_control.hpp"
 #include "../shared/uf_shm_ring.hpp"
+#include "../shared/uf_tx_fill.hpp"
 
 // Short names for the user-client ABI. Defined in terms of the shared header rather than copied out
 // of it, so the two cannot drift.
@@ -78,6 +80,13 @@ static const uint64_t kTxMinLeadPkts = 8;   // 1 ms: below this we have lost the
 
 static std::atomic<bool> g_run{true};
 static void on_signal(int) { g_run.store(false); }
+
+// SIGUSR1 arms (or re-arms) a capture. This exists because arming via UF_CAP_WAV alone requires
+// STARTING the daemon, and a fresh session is precisely what clears the intermittent faults we are
+// trying to record — every capture taken that way came back clean by construction. With this, the
+// daemon stays up and the capture is triggered while the fault is audible.
+static std::atomic<bool> g_armCapture{false};
+static void on_arm_capture(int) { g_armCapture.store(true); }
 
 // The device configuration shadow. Most FF800 registers are write-only, so the host copy is the
 // source of truth and every change rebuilds the whole conf block from it (spec/02 §2.5). Currently
@@ -279,7 +288,7 @@ static bool status_read(const volatile struct UFOhciStatus* s, struct UFOhciStat
 }
 
 // ── a shared-memory ring, created + owned by the daemon ─────────────────────────────────────────
-static uf::shm::Ring* make_ring(const char* name) {
+static uf::shm::Ring* make_ring(const char* name, uint64_t instanceId) {
     shm_unlink(name);
     int fd = shm_open(name, O_CREAT | O_RDWR, 0666);
     if (fd < 0) { std::perror("shm_open"); return nullptr; }
@@ -288,7 +297,7 @@ static uf::shm::Ring* make_ring(const char* name) {
     close(fd);
     if (p == MAP_FAILED) { std::perror("mmap"); return nullptr; }
     auto* r = static_cast<uf::shm::Ring*>(p);
-    r->init();
+    r->init(instanceId);
     return r;
 }
 
@@ -500,6 +509,7 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
 }
 
 int main() {
+    std::signal(SIGUSR1, on_arm_capture);
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
@@ -570,8 +580,11 @@ int main() {
     const uint64_t kPumpPeriodTicks = (uint64_t)(1.0e6 * ptb.denom / ptb.numer);   // 1 ms in mach ticks
     uint64_t deadline = mach_absolute_time(), pumpLate = 0, wakeTimeouts = 0;
 
-    uf::shm::Ring* cap = make_ring(uf::shm::kCaptureName);
-    uf::shm::Ring* play = make_ring(uf::shm::kPlaybackName);
+    // One id per daemon run, stamped into both rings so the plugin can tell a restart from a
+    // repeat sighting of the ring it already has.
+    const uint64_t runId = mach_absolute_time();
+    uf::shm::Ring* cap = make_ring(uf::shm::kCaptureName, runId);
+    uf::shm::Ring* play = make_ring(uf::shm::kPlaybackName, runId);
     if (!cap || !play) return 1;
     // Tell the plugin what is actually on the wire. Until this is set it advertises nothing, so
     // CoreAudio cannot select a rate we are not at.
@@ -633,7 +646,7 @@ int main() {
     // Host clock ticks per audio frame — used to back-date the clock anchor onto the period boundary
     // it belongs to (see the publish below).
     double hostTicksPerFrame = 1.0e9 / (double)rate * (double)tb.denom / (double)tb.numer;
-    uint64_t rt0 = mach_absolute_time(), rf0 = 0, rc0 = 0, tx0 = 0, irq0 = 0;
+    uint64_t rt0 = mach_absolute_time(), rf0 = 0, rc0 = 0, tx0 = 0, irq0 = 0, txHeld0 = 0;
     uint64_t toneStart = mach_absolute_time(); int toneCh = -1;   // UF_TX_TONE per-channel sweep
     std::vector<int32_t> wavSamps; uint64_t wavFrames = 0;        // UF_TX_WAV=<raw s32le stereo 48k>
     if (const char* wp = getenv("UF_TX_WAV")) {
@@ -663,9 +676,14 @@ int main() {
         getenv("UF_CYCLE_GAP") ? (uint32_t)atoi(getenv("UF_CYCLE_GAP")) : 8;
     // Transmit pacing state. txFillPkt is the monotonic packet index we have filled up to and mirrors
     // the dext's itFillCursor; it starts one lap ahead because IsoTxStart leaves the whole ring
-    // populated with silence. ps/psPos thread a frame cursor through the plugin's fixed-size slots.
-    uint64_t txFillPkt = kTxSlots, txResyncs = 0, txDry = 0, txLastSent = 0;
-    const uf::shm::Slot* ps = nullptr; uint32_t psPos = 0;
+    // populated with silence. txSrc below threads a frame cursor through the plugin's slots.
+    uint64_t txFillPkt = kTxSlots, txResyncs = 0, txDry = 0, txLastSent = 0, txHeld = 0;
+    // Where a transmit frame comes from: the playback ring when it has one, the last real frame
+    // (decaying) when it does not. Lives in platform/shared so it can be unit-tested with no FF800
+    // attached — tests/test_tx_fill.cpp. The per-tick `dry` latch that used to live here inline is
+    // what caused the 192 kHz ring modulation, and it went unfound for days precisely because
+    // nothing could reach it from a test.
+    uf::TxFill txSrc(dbq);
     const bool txFreeRun = getenv("UF_TX_FREERUN") != nullptr;   // A/B against the old free-running fill
     const bool txPaced   = !txFreeRun && !getenv("UF_NO_TX");
     // Clock servo. The FF800 fetches playback at its own crystal (~48002), we deliver a base 48000
@@ -684,7 +702,43 @@ int main() {
     const double pacedToneFreq = getenv("UF_TX_FREQ") ? atof(getenv("UF_TX_FREQ")) : 437.0;
     double pacedTonePhase = 0.0;
     const double pacedTonePhaseInc = 2.0 * M_PI * pacedToneFreq / (double)rate;
+    // UF_TX_VIBRATO=<Hz>: slow frequency modulation, off by default. A dead-steady tone is the
+    // right thing to MEASURE — sidebands stand out against it — but it is a poor thing to JUDGE by
+    // ear, because there is nothing to compare the timbre against and roughness is easy to talk
+    // yourself into. A tone that moves gives the ear a reference: the pitch should glide smoothly
+    // and the timbre should not change with it. Phase-continuous, so it adds no clicks of its own.
+    const double vibHz = getenv("UF_TX_VIBRATO") ? atof(getenv("UF_TX_VIBRATO")) : 0.0;
+    const double vibDepth = getenv("UF_TX_VIB_DEPTH") ? atof(getenv("UF_TX_VIB_DEPTH")) : 0.03;
+    double vibPhase = 0.0;
+    const double vibPhaseInc = 2.0 * M_PI * vibHz / (double)rate;
+    if (vibHz > 0)
+        std::printf("uf-daemon: tone %.1f Hz with %.2f Hz vibrato, depth %.1f%%\n",
+                    pacedToneFreq, vibHz, vibDepth * 100.0);
     uint64_t txCursor = 0; uint32_t txFill = 0; uint8_t* txSlotPtr = txBuf;
+    // UF_CAP_WAV=<path>: write decoded capture straight to a WAV, taken from the decode loop BEFORE
+    // the shm ring. That matters — it is a copy, not a second consumer, so it does not break the
+    // ring's single-producer/single-consumer invariant the way an external capture tool would. With
+    // this plus UF_TX_PACED_TONE, a loopback cable gives a measurement with no CoreAudio anywhere in
+    // it: the daemon generates the signal and the daemon records what came back.
+    const char* capWavPath = getenv("UF_CAP_WAV");
+    const double capWavSecs = getenv("UF_CAP_SECONDS") ? atof(getenv("UF_CAP_SECONDS")) : 10.0;
+    const uint64_t capWavLimit = capWavPath ? (uint64_t)(capWavSecs * rate) : 0;
+    std::vector<int32_t> capWav;
+    uint64_t capWavFrames = 0;
+    bool capWavDone = false;
+    // UF_CAP_SIGNAL=1 holds the capture back until SIGUSR1, so it can be triggered mid-episode.
+    const bool capOnSignal = getenv("UF_CAP_SIGNAL") != nullptr;
+    if (capOnSignal) capWavDone = true;          // "not capturing"; SIGUSR1 clears it
+    if (capWavPath) {
+        capWav.reserve((size_t)capWavLimit * dbq);
+        std::printf("uf-daemon: capturing %.1f s of %u-channel input to %s\n",
+                    capWavSecs, dbq, capWavPath);
+        if (capOnSignal)
+            std::printf("uf-daemon: capture ARMED ON SIGNAL — kill -USR1 %d to start it\n", getpid());
+    }
+
+    uint64_t lastAnchorAt = 0;       // when we last published a clock anchor
+    double   anchorGapMaxMs = 0.0;   // worst anchor interval this second (see the publish site)
     uint64_t playMinDepth = ~0ull;   // shallowest the playback ring got this second
     uint64_t lastProgress = mach_absolute_time();   // when capture last advanced (wedge detection)
     uint64_t lastConsumedForWedge = 0, wedgeRestarts = 0, restarts = 0;
@@ -724,7 +778,7 @@ int main() {
         lastConsumed = 0;                   // else the per-second delta underflows into nonsense
         capSlot = nullptr; capFill = 0;
         txFillPkt = kTxSlots; txLastSent = 0; txCursor = 0; txFill = 0; txSlotPtr = txBuf;
-        ps = nullptr; psPos = 0;
+        txSrc.reset();   // the restarted session gets a fresh ring; drop any held slot
         frame.assign(dbq, 0);
         slotBytes.assign(kTxSlots, fullPayload);
         std::memset(txBuf, 0, txSize);      // stale PCM at the old geometry is noise at the new one
@@ -794,16 +848,25 @@ int main() {
                 // for UF_SAFETY_OFFSET_MS directly. Depth is in slots; each slot is
                 // kFramesPerSlot frames, so a minimum of N slots means roughly N x (512/rate) of
                 // margin — trim the offset toward zero margin, never past it.
+                std::printf("  ANCHOR: worst gap %.1f ms this second (nominal %.1f ms)  "
+                            "HAL clock=%s seed=%llu unlocks=%u\n",
+                            anchorGapMaxMs, (double)uf::shm::kAnchorFrames * 1000.0 / rate,
+                            cap->halLocked.load(std::memory_order_relaxed) ? "LOCKED" : "FREE-RUN",
+                            (unsigned long long)cap->halSeed.load(std::memory_order_relaxed),
+                            cap->halUnlocks.load(std::memory_order_relaxed));
+                anchorGapMaxMs = 0.0;
                 std::printf("  MARGIN: play ring min=%llu slots = %.1f ms spare (under=%u)\n",
                             (unsigned long long)playMinDepth,
                             (double)playMinDepth * uf::shm::kFramesPerSlot * 1000.0 / rate,
                             play->underruns.load());
                 playMinDepth = ~0ull;
                 if (!txFreeRun && !getenv("UF_NO_TX"))
-                    std::printf("  TX: %.0f pkt/s  lead=%lld pkt  resync=%llu dry=%llu  "
+                    std::printf("  TX: %.0f pkt/s  lead=%lld pkt  resync=%llu dry=%llu held=%llu (%.2f ms/s)  "
                                 "play ring=%llu over=%u under=%u  servo=%d rate=%.1f acc=%+.2f\n",
                                 (txLastSent - tx0) / el, (long long)(txFillPkt - txLastSent),
                                 (unsigned long long)txResyncs, (unsigned long long)txDry,
+                                (unsigned long long)txHeld,
+                                (txHeld - txHeld0) * 1000.0 / rate / el,
                                 (unsigned long long)play->depth(), play->overruns.load(),
                                 play->underruns.load(), servoOn ? 1 : 0, measuredRate, servoAccum);
                 // Live device status — the FF800's own view of its clock. We are hunting the "host
@@ -844,8 +907,20 @@ int main() {
                 }
                 std::fflush(stdout);
                 rt0 = now; rf0 = deviceFrames; rc0 = consumed; ct0 = ct; tx0 = txLastSent;
+                txHeld0 = txHeld;
             }
         }
+        // A SIGUSR1 since the last tick starts a fresh capture, whether or not one already ran —
+        // so several episodes can be recorded in one daemon lifetime.
+        if (g_armCapture.exchange(false) && capWavPath) {
+            capWav.clear();
+            capWav.reserve((size_t)capWavLimit * dbq);
+            capWavFrames = 0;
+            capWavDone = false;
+            std::printf("uf-daemon: capture STARTED (%.1f s to %s)\n", capWavSecs, capWavPath);
+            std::fflush(stdout);
+        }
+
         // MIDI in. One cheap external method per tick; at 31250 baud the device can produce at most
         // ~3 bytes in a millisecond, well inside the 8 a poll returns.
         if (g_midiSrc) midi_poll_in();
@@ -923,7 +998,10 @@ int main() {
                 seenRequest = req;
                 const uint32_t want = cap->requestedRate.load(std::memory_order_acquire);
                 if (want && want != rate && uf::is_supported_rate(want)) {
-                    if (!restart_session(want, "rate change")) break;
+                    // Same rule as the wedge path: a rate change that lands during sleep must
+                    // be retried, not treated as the end of the daemon.
+                    if (!restart_session(want, "rate change"))
+                        lastProgress = mach_absolute_time();
                     continue;
                 }
             }
@@ -971,8 +1049,25 @@ int main() {
                     // Push into the shm ring for the plugin; a full ring drops the frame — but the
                     // clock (deviceFrames) still counts it below, so the timebase never stalls.
                     if (!capSlot) { capSlot = cap->acquireWrite(); capFill = 0; }
-                    if (capSlot) {
+                    if (capSlot || (capWavPath && !capWavDone)) {
                         uf::decode_frame(payload + (size_t)k * dbq * 4, dbq, frame.data());
+                        if (capWavPath && !capWavDone) {
+                            capWav.insert(capWav.end(), frame.begin(), frame.begin() + dbq);
+                            if (++capWavFrames >= capWavLimit) {
+                                auto bytes = uf::write_wav(capWav, rate, (uint16_t)dbq);
+                                if (FILE* wf = fopen(capWavPath, "wb")) {
+                                    fwrite(bytes.data(), 1, bytes.size(), wf);
+                                    fclose(wf);
+                                    std::printf("uf-daemon: wrote %s (%llu frames, %u ch)\n",
+                                                capWavPath, (unsigned long long)capWavFrames, dbq);
+                                    std::fflush(stdout);
+                                } else std::perror("uf-daemon: capture wav");
+                                capWav.clear(); capWav.shrink_to_fit();
+                                capWavDone = true;
+                            }
+                        }
+                    }
+                    if (capSlot) {
                         int32_t* dst = capSlot->audio + (size_t)capFill * uf::shm::kMaxChannels;
                         for (uint32_t c = 0; c < ch; ++c)
                             dst[c] = frame[c] << 8;                       // 24->32
@@ -1041,7 +1136,8 @@ int main() {
                 ++cycleRestarts;
                 std::printf("uf-daemon: cycle discontinuity — %u cycles missed at once\n", gap - 1);
                 haveCycle = false;
-                if (!restart_session(rate, "cycle-time discontinuity")) break;
+                if (!restart_session(rate, "cycle-time discontinuity"))
+                    lastProgress = mach_absolute_time();   // retry on the wedge schedule, do not exit
                 continue;
             }
         }
@@ -1065,12 +1161,22 @@ int main() {
             const double limit = wedgeRestarts >= 3 ? 5000.0 : kWedgeMs;
             if (stalledMs > limit) {
                 ++wedgeRestarts;
-                if (!restart_session(rate, "capture stalled — device wedged")) break;
+                // A failed rebuild is "not yet", never "give up". The commonest cause by far is
+                // system sleep: the dext gates all MMIO while the PCIe bridge is powered down, so
+                // session_start CANNOT succeed until the machine is awake again. Treating that as
+                // fatal is what made the daemon exit on every lid-close, leaving no audio after
+                // wake even though the controller had rebuilt itself perfectly.
+                //
+                // Resetting lastProgress restarts the backoff clock, so we retry on the same
+                // schedule as any other wedge (5 s once it has failed a few times) instead of
+                // spinning on a device that is simply not there.
+                if (!restart_session(rate, "capture stalled — device wedged"))
+                    lastProgress = mach_absolute_time();
                 continue;
             }
         }
 
-        // Publish the device-paced clock anchor, once per ZeroTimeStampPeriod (kFramesPerSlot).
+        // Publish the device-paced clock anchor, once per ZeroTimeStampPeriod (kAnchorFrames).
         // CoreAudio locks its timeline to this, so it pulls at the real device rate.
         //
         // The anchor must be the (frame, host time) correspondence at the START of a period: both
@@ -1086,11 +1192,20 @@ int main() {
         // thread's own clock only as a fallback.
         const uint64_t anchorFrames = haveAnchor ? framesAtSnap : deviceFrames;
         const uint64_t anchorHost   = haveAnchor ? snap.hostTime : mach_absolute_time();
-        if (anchorFrames >= lastPublish + uf::shm::kFramesPerSlot) {
-            lastPublish = anchorFrames / uf::shm::kFramesPerSlot * uf::shm::kFramesPerSlot;
+        if (anchorFrames >= lastPublish + uf::shm::kAnchorFrames) {
+            lastPublish = anchorFrames / uf::shm::kAnchorFrames * uf::shm::kAnchorFrames;
             const double past = (double)(anchorFrames - lastPublish);
             cap->publishTimestamp((double)lastPublish,
                                   anchorHost - (uint64_t)(past * hostTicksPerFrame));
+            // Longest interval between anchors this second. The plugin's clock unlocks when an
+            // anchor falls further behind than its staleness window, so a spike here is the daemon
+            // side of a re-lock — which is what we are trying to line up against audible gating.
+            const uint64_t nowT = mach_absolute_time();
+            if (lastAnchorAt) {
+                const double gapMs = double(nowT - lastAnchorAt) * tb.numer / tb.denom / 1e6;
+                if (gapMs > anchorGapMaxMs) anchorGapMaxMs = gapMs;
+            }
+            lastAnchorAt = nowT;
         }
 
         // Playback: encode the plugin's PCM into the transmit ring's FULL slots (blocking mode). Each
@@ -1155,10 +1270,11 @@ int main() {
                 ++txResyncs;
             }
             const uint64_t target = sent + kTxLeadPkts;
-            bool dry = false;
+            txSrc.beginTick();
             for (; txFillPkt < target; ++txFillPkt) {
                 const uint32_t slot = (uint32_t)(txFillPkt % kTxSlots);
                 if (!uf::is_full_packet(slot, fullCount, kTxSlots)) continue;  // empty packet, no payload
+                txSrc.beginPacket();   // re-arms the acquire attempt: scoped to a PACKET, not a tick
 
                 // Servo: this packet carries sytInterval frames, plus one whenever the accumulated
                 // fractional debt against the measured device rate reaches a frame (or minus one if we
@@ -1181,31 +1297,34 @@ int main() {
 
                 uint8_t* base = txBuf + (size_t)slot * kTxSlotBytes;
                 for (uint32_t f = 0; f < frames; ++f) {
-                    int32_t src[uf::shm::kMaxChannels] = {0};
-                    uint32_t nsrc = 0;
+                    // The tone path synthesises straight into the packet so the servo can be tested
+                    // from the daemon alone; the normal path takes its frame from uf::TxFill, which
+                    // is where the ring-miss policy lives (and where it is unit-tested).
+                    int32_t tone[uf::shm::kMaxChannels] = {0};
+                    const int32_t* frameSrc;
                     if (pacedToneCh >= 0) {
                         // Top-justified like a shm-ring sample (the encode below applies >>8): 2^30 = -6 dBFS.
-                        if (pacedToneCh < (int)dbq) src[pacedToneCh] = (int32_t)(1073741824.0 * std::sin(pacedTonePhase));
-                        pacedTonePhase += pacedTonePhaseInc;
+                        if (pacedToneCh < (int)dbq)
+                            tone[pacedToneCh] = (int32_t)(1073741824.0 * std::sin(pacedTonePhase));
+                        if (vibHz > 0) {
+                            pacedTonePhase += pacedTonePhaseInc * (1.0 + vibDepth * std::sin(vibPhase));
+                            vibPhase += vibPhaseInc;
+                            if (vibPhase > 2.0 * M_PI) vibPhase -= 2.0 * M_PI;
+                        } else {
+                            pacedTonePhase += pacedTonePhaseInc;
+                        }
                         if (pacedTonePhase > 2.0 * M_PI) pacedTonePhase -= 2.0 * M_PI;
-                        nsrc = dbq;
+                        frameSrc = tone;
                     } else {
-                        if (ps && psPos >= ps->frameCount) { play->commitRead(); ps = nullptr; }
-                        // One acquire attempt per tick: the plugin having nothing for us is normal at
-                        // startup, and retrying per frame would bury the ring's underrun counter.
-                        if (!ps && !dry) { ps = play->acquireRead(); psPos = 0; if (!ps) dry = true; }
-                        nsrc = ps ? (ps->channelCount ? ps->channelCount : dbq) : 0;
+                        frameSrc = txSrc.frame(*play);
                     }
                     uint8_t* fr = base + (size_t)f * dbq * 4;
-                    for (uint32_t c = 0; c < dbq; ++c) {
-                        int32_t s = (pacedToneCh >= 0) ? src[c]
-                                  : (ps && c < nsrc) ? ps->audio[(size_t)psPos * nsrc + c] : 0;
-                        uf::encode_sample_le(s >> 8, fr + (size_t)c * 4);   // ring int32 -> 24-bit
-                    }
-                    if (pacedToneCh < 0 && ps) ++psPos;
+                    for (uint32_t c = 0; c < dbq; ++c)
+                        uf::encode_sample_le(frameSrc[c] >> 8, fr + (size_t)c * 4);  // int32 -> 24-bit
                 }
             }
-            if (dry) ++txDry;   // the refill is handed back on the next tick's pump_dext
+            if (txSrc.dryTick()) ++txDry;   // refill is handed back on the next tick's pump_dext
+            txHeld = txSrc.held();
         }
 
         // Sample how much playback the plugin is keeping ahead of us. The minimum over a

@@ -47,13 +47,23 @@ public:
     // duration rather than a frame count. Constant for the life of the process.
     ZeroTimeStampClock(uint32_t period, double ticksPerFrame, double ticksPerSecond)
         : period_(period ? period : 1) {
-        const double st = ticksPerSecond * (double)kStaleNanos / 1.0e9;
-        staleTicks_ = st >= 1.0 ? (uint64_t)st : 1;
+        const double m = ticksPerSecond * (double)kStaleMarginNanos / 1.0e9;
+        staleMarginTicks_ = m >= 1.0 ? (uint64_t)m : 1;
         setTicksPerFrame(ticksPerFrame);
     }
 
-    // The staleness window in host ticks — the same duration at every sample rate.
-    uint64_t staleTicks() const { return staleTicks_; }
+    // How far behind `now` the anchor may fall before we stop believing it.
+    //
+    // Two things have to fit inside it, and they scale differently, which is why one number will not
+    // do. The publishing jitter — scheduling, a pump tick, the IPC — is roughly constant in
+    // milliseconds. The anchor INTERVAL is a fixed frame count, so its duration shrinks as the rate
+    // rises: kAnchorFrames is 42.7 ms at 48 kHz but 10.7 ms at 192 kHz. A window that ignored the
+    // interval would unlock on every single anchor at the lower rates.
+    //
+    // So the window is one anchor interval plus a fixed margin. Earlier versions got this wrong twice
+    // in the same way — counting in frames, so the tolerance shrank exactly where deadlines tightened
+    // — and this is the shape that is right at both ends.
+    uint64_t staleTicks() const { return staleMarginTicks_ + ticksPerPeriod_; }
 
     // Follows a nominal-rate change. Only affects free-running; while locked the device sets the rate.
     void setTicksPerFrame(double ticksPerFrame) {
@@ -61,20 +71,9 @@ public:
         ticksPerPeriod_ = t >= 1.0 ? (uint64_t)t : 1;
     }
 
-    // How far behind `now` the anchor may fall before we stop believing it. Also the freshness bound
-    // on the device pair, so a plausible device anchor can never violate invariant 3.
-    //
-    // Specified in TIME, not in periods. What has to fit inside this window is the daemon's
-    // publishing jitter — scheduling, a pump tick, the IPC — all of which are roughly constant in
-    // milliseconds. A period is 512 frames, so a fixed count of them shrinks as the rate rises:
-    // 43 ms at 48 kHz but 21 ms at 96 kHz and 11 ms at 192 kHz, tightening the tolerance exactly
-    // where the deadlines are already tightest. That is the same mistake as sizing the safety offset
-    // in frames, and it showed up on hardware at 96 kHz as a momentary stall on a routing change —
-    // the clock dropping lock, free-running, and re-anchoring.
-    //
-    // ~43 ms is what four periods gave at 48 kHz, which rode out DAW load fine, so it is kept as the
-    // absolute figure at every rate.
-    static constexpr uint64_t kStaleNanos = 43'000'000;
+    // The fixed part of the staleness window, on top of one anchor interval. ~43 ms rode out DAW load fine when it was the
+    // whole budget, so it is ample as the margin alone.
+    static constexpr uint64_t kStaleMarginNanos = 43'000'000;
 
     // `now` = mach_absolute_time(). devValid is false when the ring is unmapped or the seqlock read
     // tore; devSample/devHost are the ring's latest published anchor.
@@ -114,7 +113,7 @@ public:
         // rather than bouncing the seed on ordinary seqlock contention.
         if (now > host_) {
             const uint64_t lag = now - host_;
-            if (locked_ && lag > staleTicks_) { locked_ = false; ++seed_; }
+            if (locked_ && lag > staleTicks()) { locked_ = false; ++seed_; }
             if (!locked_) {
                 const uint64_t periods = lag / ticksPerPeriod_;   // free-run at the nominal rate
                 if (periods) {
@@ -135,12 +134,12 @@ private:
     bool plausible(uint64_t now, double devSample, uint64_t devHost) const {
         if (devHost == 0 || !std::isfinite(devSample) || devSample < 0) return false;
         if (devHost > now) return devHost - now <= ticksPerPeriod_;
-        return now - devHost <= staleTicks_;
+        return now - devHost <= staleTicks();
     }
 
     const uint32_t period_;
     uint64_t ticksPerPeriod_ = 1;
-    uint64_t staleTicks_ = 1;
+    uint64_t staleMarginTicks_ = 1;
     double   sample_  = 0;      // our timeline: always a multiple of period_, never decreasing
     uint64_t host_    = 0;
     uint64_t seed_    = 1;      // CoreAudio treats a change as "timeline discontinuity, re-anchor"

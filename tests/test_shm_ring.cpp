@@ -10,14 +10,14 @@ using uf::shm::Slot;
 using uf::shm::kSlots;
 
 UF_TEST(empty_ring_reads_nothing) {
-    Ring r; r.init();
+    Ring r; r.init(1);
     UF_CHECK_EQ(r.depth(), 0u);
     UF_CHECK(r.acquireRead() == nullptr);       // empty -> underrun
     UF_CHECK_EQ(r.underruns.load(), 1u);
 }
 
 UF_TEST(write_then_read_roundtrips) {
-    Ring r; r.init();
+    Ring r; r.init(1);
     Slot* w = r.acquireWrite();
     UF_CHECK(w != nullptr);
     w->frameCount = 512; w->channelCount = 28; w->audio[0] = 0x123456;
@@ -33,7 +33,7 @@ UF_TEST(write_then_read_roundtrips) {
 }
 
 UF_TEST(full_ring_reports_overrun) {
-    Ring r; r.init();
+    Ring r; r.init(1);
     for (uint32_t i = 0; i < kSlots; ++i) { UF_CHECK(r.acquireWrite() != nullptr); r.commitWrite(); }
     UF_CHECK_EQ(r.depth(), kSlots);
     UF_CHECK(r.acquireWrite() == nullptr);      // full -> overrun
@@ -41,7 +41,7 @@ UF_TEST(full_ring_reports_overrun) {
 }
 
 UF_TEST(wraps_past_capacity) {
-    Ring r; r.init();
+    Ring r; r.init(1);
     // Push and pop 3x the ring size one at a time; the index & (kSlots-1) must wrap cleanly.
     for (uint32_t i = 0; i < kSlots * 3; ++i) {
         Slot* w = r.acquireWrite(); UF_CHECK(w != nullptr);
@@ -52,7 +52,7 @@ UF_TEST(wraps_past_capacity) {
 }
 
 UF_TEST(concurrent_producer_consumer) {
-    static Ring r; r.init();
+    static Ring r; r.init(1);
     const int N = 100000;
     std::thread prod([&]{
         for (int i = 0; i < N; ) {
@@ -73,13 +73,13 @@ UF_TEST(concurrent_producer_consumer) {
 }
 
 UF_TEST(timestamp_unpublished_reads_false) {
-    Ring r; r.init();
+    Ring r; r.init(1);
     double st; uint64_t ht, seed;
     UF_CHECK(!r.readTimestamp(&st, &ht, &seed));     // nothing published yet
 }
 
 UF_TEST(timestamp_roundtrips) {
-    Ring r; r.init();
+    Ring r; r.init(1);
     r.publishTimestamp(48000.0, 123456789ull);
     double st = 0; uint64_t ht = 0, seed = 0;
     UF_CHECK(r.readTimestamp(&st, &ht, &seed));
@@ -89,7 +89,7 @@ UF_TEST(timestamp_roundtrips) {
 }
 
 UF_TEST(timestamp_concurrent_never_torn) {
-    static Ring r; r.init();
+    static Ring r; r.init(1);
     std::thread pub([&]{
         for (uint64_t i = 1; i <= 200000; ++i) r.publishTimestamp((double)i, i * 1000ull);
     });

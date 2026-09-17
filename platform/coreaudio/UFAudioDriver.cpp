@@ -73,6 +73,7 @@ public:
         if (thread_.joinable()) thread_.join();
     }
     uf::shm::Ring* capture()  const { return capture_.ring.load(std::memory_order_acquire); }
+    uf::shm::Ring* playback() const { return playback_.ring.load(std::memory_order_acquire); }
 
     // Called on the background thread each time a NEW capture ring is attached — i.e. whenever the
     // daemon restarts. The daemon always comes up at its own default rate with no idea what
@@ -80,14 +81,11 @@ public:
     // when the rate CHANGES. So a daemon restarted while the host sits at 96 kHz streams 48 kHz
     // indefinitely, and playback runs at half speed. This is the hook that closes that.
     void setOnCaptureAttach(std::function<void()> fn) { onAttach_ = std::move(fn); }
-    uf::shm::Ring* playback() const { return playback_.ring.load(std::memory_order_acquire); }
 
 private:
     struct Mapping {
         const char* name;
         std::atomic<uf::shm::Ring*> ring{nullptr};
-        dev_t dev = 0;
-        ino_t ino = 0;
     };
     struct Retired {
         void* addr;
@@ -103,26 +101,33 @@ private:
         }
     }
 
-    // Map `m`'s ring if it is absent or has been replaced by a newer shm object.
+    // Map `m`'s ring if it is absent or has been replaced by a newer one.
+    //
+    // Identity comes from a value the daemon writes INTO the ring, not from the shm object: on macOS
+    // fstat() reports st_dev=0 and st_ino=0 for every POSIX shm object, so the obvious identity check
+    // compares equal to itself forever and never fires. That is not a subtle failure — it made this
+    // whole class a no-op, and the plugin went on writing into rings nobody was reading.
+    //
+    // So each poll maps a fresh probe and reads the run id out of it. Cheap at 2 Hz, and the only
+    // thing that actually distinguishes one daemon run from the next.
     void refresh(Mapping& m) {
         int fd = shm_open(m.name, O_RDWR, 0);
         if (fd < 0) return;                       // daemon not running; keep whatever we have
-        struct stat st = {};
-        if (fstat(fd, &st) != 0) { close(fd); return; }
-        if (m.ring.load(std::memory_order_relaxed) && st.st_dev == m.dev && st.st_ino == m.ino) {
-            close(fd);                            // same object, still current
-            return;
-        }
         void* p = mmap(nullptr, sizeof(uf::shm::Ring), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
         if (p == MAP_FAILED) return;
-        if (static_cast<uf::shm::Ring*>(p)->magic != uf::shm::kMagic) {  // daemon still initialising
+        auto* probe = static_cast<uf::shm::Ring*>(p);
+        if (probe->magic != uf::shm::kMagic) {    // still initialising, or an incompatible layout
             munmap(p, sizeof(uf::shm::Ring));
             return;
         }
-        void* old = m.ring.exchange(static_cast<uf::shm::Ring*>(p), std::memory_order_acq_rel);
-        m.dev = st.st_dev;
-        m.ino = st.st_ino;
+        if (uf::shm::Ring* cur = m.ring.load(std::memory_order_relaxed)) {
+            if (cur->instance == probe->instance) {   // the ring we already have
+                munmap(p, sizeof(uf::shm::Ring));
+                return;
+            }
+        }
+        void* old = m.ring.exchange(probe, std::memory_order_acq_rel);
         if (old) {
             std::lock_guard<std::mutex> lock(retiredMutex_);
             retired_.push_back({old, std::chrono::steady_clock::now()});
@@ -355,24 +360,30 @@ static UInt32 safetyFrames(double rate) {
 class UFStream : public aspl::Stream {
 public:
     UFStream(std::shared_ptr<const aspl::Context> ctx, std::shared_ptr<aspl::Device> dev,
-             const aspl::StreamParameters& p, std::string group, uf::Direction dir)
-        : aspl::Stream(std::move(ctx), std::move(dev), p), group_(std::move(group)), dir_(dir) {}
+             const aspl::StreamParameters& p, uint32_t channels)
+        : aspl::Stream(std::move(ctx), std::move(dev), p), channels_(channels) {}
 
-    // One entry per rate at which this group exists. ADAT contributes nothing at 4x, where the group
-    // is gone entirely — the device removes the stream at that speed class, so an entry claiming
-    // otherwise would be a format the hardware cannot produce.
+    // The SAME channel count at every rate, which is what the factory driver does — TotalMix shows
+    // 20 channels at 96 kHz while CoreAudio still sees 28.
+    //
+    // The device really does carry fewer channels as the rate rises (ADAT halves at 2x, vanishes at
+    // 4x), so shrinking the streams to match is the more truthful description. It is also worse to
+    // use: a DAW stores its output routing by channel index, so channels disappearing under a rate
+    // change silently sends tracks nowhere and the user has to rebuild the routing — which is
+    // exactly what happened here when the count went 48 -> 28. Holding the layout fixed means a
+    // session survives a rate change, and the channels the hardware cannot carry are simply silent:
+    // the daemon only transmits the first `dbq` ring columns, so the surplus goes nowhere on its own.
+    //
+    // It also removes stream add/remove from a live property-set, which is the prime suspect for the
+    // one-off Ableton crash on the first 48 -> 96 switch.
     std::vector<AudioStreamRangedDescription> formats() const {
         std::vector<AudioStreamRangedDescription> v;
         for (double r : kRates) {
-            for (const auto& g : uf::channel_groups(dir_, uf::speed_for_rate((uint32_t)r))) {
-                if (g.name != group_) continue;
-                AudioStreamRangedDescription d = {};
-                d.mFormat = ff800_format(g.count);
-                d.mFormat.mSampleRate = r;
-                d.mSampleRateRange = {r, r};
-                v.push_back(d);
-                break;
-            }
+            AudioStreamRangedDescription d = {};
+            d.mFormat = ff800_format(channels_);
+            d.mFormat.mSampleRate = r;
+            d.mSampleRateRange = {r, r};
+            v.push_back(d);
         }
         return v;
     }
@@ -380,8 +391,7 @@ public:
     std::vector<AudioStreamRangedDescription> GetAvailableVirtualFormats() const override { return formats(); }
 
 private:
-    std::string group_;
-    uf::Direction dir_;
+    uint32_t channels_;
 };
 
 // Per-channel names — "Analog 1", "Mic 9", "SPDIF L", "ADAT 3" instead of "Input 1..28".
@@ -500,6 +510,7 @@ public:
         // confused with CoreAudio's discontinuity seed, which the clock owns.
         bool valid = false;
         double devSample = 0; uint64_t devHost = 0, seqseed = 0;
+        uint32_t devRate = 0;
         if (uf::shm::Ring* cap = shm_->capture()) {
             // Only follow the device clock while the device is at the rate CoreAudio thinks it is.
             // Our sample times count REAL frames off the wire, so if the daemon is still streaming
@@ -507,13 +518,36 @@ public:
             // running 8.8% fast — audibly, a pitch shift. Free-running at the nominal rate through
             // the switch is wrong by a few tens of milliseconds; following it is wrong by 8.8%
             // indefinitely.
-            const uint32_t devRate = cap->deviceRate.load(std::memory_order_acquire);
+            devRate = cap->deviceRate.load(std::memory_order_acquire);
             if (devRate != 0 && (double)devRate == nominal)
                 for (int retry = 0; retry < 4 && !valid; ++retry)
                     valid = cap->readTimestamp(&devSample, &devHost, &seqseed);
         }
 
         const auto s = clock_.next(mach_absolute_time(), valid, devSample, devHost);
+
+        // Log only TRANSITIONS — losing or regaining the device clock, and every discontinuity seed
+        // the HAL is handed. Both are rare, so this costs nothing on the IO thread in steady state,
+        // and it answers the question the counters cannot: whether an audible burst of gating
+        // coincides with the clock re-locking. A re-lock makes the HAL re-estimate its rate, and
+        // while that estimate is wrong it delivers audio at the wrong rate — the plugin's writes and
+        // the daemon's reads then slide through each other, which is what gating looks like.
+        // Publish clock state to the daemon through the ring rather than os_log: coreaudiod writes
+        // nothing to the unified log (verified — zero lines from it at any level),
+        // so anything logged here is invisible. The daemon's stdout we can read. Plain relaxed
+        // stores of three words, only on a transition; nothing here blocks the IO thread.
+        const bool nowLocked = clock_.locked();
+        if (nowLocked != wasLocked_ || s.seed != lastSeed_) {
+            if (uf::shm::Ring* cap = shm_->capture()) {
+                cap->halLocked.store(nowLocked ? 1u : 0u, std::memory_order_relaxed);
+                cap->halSeed.store(s.seed, std::memory_order_relaxed);
+                if (wasLocked_ && !nowLocked)
+                    cap->halUnlocks.fetch_add(1, std::memory_order_relaxed);
+            }
+            wasLocked_ = nowLocked;
+            lastSeed_  = s.seed;
+        }
+
         *outSampleTime = s.sampleTime;
         *outHostTime   = s.hostTime;
         *outSeed       = s.seed;
@@ -536,40 +570,15 @@ public:
         // handler strides by the stream format, so without this the buffers stay laid out for the
         // old rate. SetPhysicalFormatImpl only stores the value, so there is no recursion back
         // into this method.
-        // Groups resize and disappear across speed classes — ADAT halves at 2x and is gone at 4x —
-        // so a rate change is a stream reconfiguration, not just a format update. This is the shape
-        // the factory driver's format change has (it reconfigures the streams only when the change
-        // crosses a speed class), and the reason for grouping the streams in the first place.
-        const uf::Speed speed = uf::speed_for_rate((uint32_t)rate);
-        for (auto [aspDir, ufDir] : {std::pair{aspl::Direction::Output, uf::Direction::Playback},
-                                     std::pair{aspl::Direction::Input, uf::Direction::Capture}}) {
-            const auto groups = uf::channel_groups(ufDir, speed);
-            const UInt32 have = GetStreamCount(aspDir);
-            for (UInt32 i = 0; i < groups.size(); ++i) {
-                AudioStreamBasicDescription f = ff800_format(groups[i].count);
-                f.mSampleRate = rate;
-                if (i < have) {
-                    if (auto s = GetStreamByIndex(aspDir, i)) s->SetPhysicalFormatAsync(f);
-                } else {                                  // a group came back (e.g. 4x -> 1x)
-                    aspl::StreamParameters p;
-                    p.Direction = aspDir;
-                    p.StartingChannel = groups[i].start;
-                    p.Format = f;
-                    AddStreamAsync(std::make_shared<UFNamedStream>(GetContext(),
-                        std::static_pointer_cast<aspl::Device>(shared_from_this()), p,
-                        groups[i].name, ufDir));
+        // Rate only — the channel layout is deliberately fixed across speed classes (see UFStream),
+        // so there is nothing to add, remove or resize here.
+        for (auto dir : {aspl::Direction::Output, aspl::Direction::Input})
+            for (UInt32 i = 0; i < GetStreamCount(dir); ++i)
+                if (auto s = GetStreamByIndex(dir, i)) {
+                    AudioStreamBasicDescription f = s->GetPhysicalFormat();
+                    f.mSampleRate = rate;
+                    s->SetPhysicalFormatAsync(f);
                 }
-            }
-            // Drop the tail — at 4x the ADAT group has no channels at all, and a stream carrying
-            // silence would be a lie about what the device can do at that rate.
-            for (UInt32 i = (UInt32)groups.size(); i < have; ++i)
-                if (auto s = GetStreamByIndex(aspDir, i)) RemoveStreamAsync(s);
-        }
-
-        // The handler closes a cycle when the last output stream has contributed, so it has to be
-        // told when that number changes — a stale count means it waits for a stream that no longer
-        // exists and falls back to closing on the next cycle, silently adding a buffer of latency.
-        if (io_) io_->setOutputStreamCount(GetStreamCount(aspl::Direction::Output));
 
         // The cushion is a duration, so its frame count has to move with the rate — otherwise
         // switching 48k -> 192k would quietly cut it to a quarter of the time it was sized for.
@@ -603,9 +612,32 @@ public:
                      a->mSelector == kAudioDevicePropertyClockSourceNameForIDCFString);
     }
 
+    // ── IO buffer size: the RANGE only, deliberately read-only ────────────────────────────────
+    // Ableton caps at 128 frames, which is 2.7 ms at 48 kHz but 1.33 ms at 96 kHz — the knob you
+    // reach for when playback struggles, pinned shut. libASPL publishes neither the size nor its
+    // range, so the HAL uses its own defaults.
+    //
+    // An earlier attempt implemented BOTH the range and a settable size, and it hung the machine:
+    // coreaudiod pegged a core during device publication and took loginwindow and every audio client
+    // with it. The likely mechanism was the setter REJECTING values outside 32..1024 with
+    // kAudioHardwareIllegalOperationError — a negotiation that can never succeed is exactly the shape
+    // of a spin. (Suggestive, not proven: the plugin never got far enough to report its own default
+    // of 512, so it wedged before answering anything.)
+    //
+    // Hence: publish the range, implement NO setter, and let the HAL keep ownership of the actual
+    // size. There is then no negotiation to fail and no loop to enter — the worst case is that the
+    // HAL ignores the range and nothing changes. The ceiling matches kMaxCycleFrames, so any size the
+    // HAL picks inside the range is one the IO handler can already stage in a single cycle.
+    static constexpr UInt32 kMinBufferFrames = 32;
+    static constexpr UInt32 kMaxBufferFrames = 4096;   // == UFIOHandler::kMaxCycleFrames
+
+    static bool isBufferRangeProp(const AudioObjectPropertyAddress* a) {
+        return a && a->mSelector == kAudioDevicePropertyBufferFrameSizeRange;
+    }
+
     Boolean HasProperty(AudioObjectID objectID, pid_t clientPID,
                         const AudioObjectPropertyAddress* address) const override {
-        if (isClockProp(address)) return true;
+        if (isClockProp(address) || isBufferRangeProp(address)) return true;
         return UFWithChannelNames<aspl::Device>::HasProperty(objectID, clientPID, address);
     }
 
@@ -614,6 +646,10 @@ public:
                                 Boolean* outIsSettable) const override {
         if (isClockProp(address)) {
             *outIsSettable = (address->mSelector == kAudioDevicePropertyClockSource);
+            return kAudioHardwareNoError;
+        }
+        if (isBufferRangeProp(address)) {
+            *outIsSettable = false;                 // read-only on purpose; see above
             return kAudioHardwareNoError;
         }
         return UFWithChannelNames<aspl::Device>::IsPropertySettable(objectID, clientPID, address,
@@ -633,6 +669,9 @@ public:
                 return kAudioHardwareNoError;
             case kAudioDevicePropertyClockSourceNameForIDCFString:
                 *outDataSize = sizeof(AudioValueTranslation);
+                return kAudioHardwareNoError;
+            case kAudioDevicePropertyBufferFrameSizeRange:
+                *outDataSize = sizeof(AudioValueRange);
                 return kAudioHardwareNoError;
             default: break;
         }
@@ -678,6 +717,14 @@ public:
                 *outDataSize = sizeof(AudioValueTranslation);
                 return kAudioHardwareNoError;
             }
+            case kAudioDevicePropertyBufferFrameSizeRange: {
+                if (inDataSize < sizeof(AudioValueRange)) return kAudioHardwareBadPropertySizeError;
+                auto* r = static_cast<AudioValueRange*>(outData);
+                r->mMinimum = kMinBufferFrames;
+                r->mMaximum = kMaxBufferFrames;
+                *outDataSize = sizeof(AudioValueRange);
+                return kAudioHardwareNoError;
+            }
             default: break;
         }
         return UFWithChannelNames<aspl::Device>::GetPropertyData(
@@ -709,6 +756,8 @@ public:
 private:
     ShmMapper* shm_;
     uf::ZeroTimeStampClock clock_;
+    bool     wasLocked_ = false;   // for edge-triggered clock logging above
+    uint64_t lastSeed_  = 0;
     std::shared_ptr<UFIOHandler> io_;   // for keeping its output-stream count current
 };
 
@@ -724,9 +773,9 @@ static std::shared_ptr<aspl::Driver> CreateDriver() {
     dev.CanBeDefaultForSystemSounds = true;
     dev.SampleRate                  = kSampleRate;
     dev.ChannelCount                = kChannels;
-    // We publish the clock anchor once per ring slot (kFramesPerSlot), so that is the period between
-    // successive GetZeroTimeStamp sample times.
-    dev.ZeroTimeStampPeriod         = uf::shm::kFramesPerSlot;
+    // The interval between clock anchors, matching what the daemon publishes. It is also what caps
+    // the IO buffer sizes a DAW can offer — the HAL allows up to period * 3/8 (see kAnchorFrames).
+    dev.ZeroTimeStampPeriod         = uf::shm::kAnchorFrames;
 
     // Presentation latency and safety offset. The safety offset is what tells the HAL how close to
     // "now" it may read or write; report too little and it mixes right up against the daemon's
@@ -763,7 +812,7 @@ static std::shared_ptr<aspl::Driver> CreateDriver() {
             p.Direction       = dir;
             p.StartingChannel = g.start;
             p.Format          = ff800_format(g.count);
-            device->AddStreamAsync(std::make_shared<UFNamedStream>(context, device, p, g.name, ufDir));
+            device->AddStreamAsync(std::make_shared<UFNamedStream>(context, device, p, g.count));
             ++n;
         }
         return n;
