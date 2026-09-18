@@ -373,7 +373,11 @@ static kern_return_t uf_hw_bring_up(UFFireWireOHCI_IVars* v)
         qd->control        = (uint16_t)(DESC_INPUT_MORE | DESC_STATUS | DESC_BRANCH_ALWAYS);
         qd->data_address   = (uint32_t)v->arReqAddr;
         qd->branch_address = (uint32_t)v->arReqDescAddr | 1;
-        qd->res_count = 0; qd->transfer_status = 0;
+        // res_count is the space REMAINING, which the controller decrements as it fills — so it
+        // starts at the full buffer size (Linux ohci.c: d->res_count = cpu_to_le16(PAGE_SIZE)).
+        // Starting it at 0 makes `written = kARBufferBytes - res_count` read 4096 forever, i.e. the
+        // buffer always looks completely full, and the parser walks 4 KB of stale memory as packets.
+        qd->res_count = kARBufferBytes; qd->transfer_status = 0;
         v->arReqReadBytes = 0; v->dbgArReadBytes = 0;
         reg_write(v->pci, v->barIndex, CTX_COMMAND_PTR(OHCI_AR_REQ_BASE),
                   (uint32_t)v->arReqDescAddr | 1);
@@ -1074,7 +1078,10 @@ static kern_return_t uf_write_block(UFFireWireOHCI_IVars* v, uint16_t dest, uint
         IOSleep(10);
         uf_ar_rearm(v);
     }
-    os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: write_block off=0x%llx count=%u -> 0x%x",
+    // Only log FAILURES. This fires on every register write, which includes every MIDI-out
+    // message — one unified-log line per MIDI event, written to disk, forever.
+    if (ret != kIOReturnSuccess)
+      os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: write_block FAILED off=0x%llx count=%u -> 0x%x",
            offset, count, ret);
     return ret;
 }
@@ -1531,6 +1538,20 @@ kern_return_t UFFireWireOHCI::MidiInDisable()
     return kIOReturnSuccess;
 }
 
+// TEST HOOK: force a bus reset. Read-modify-write of PHY register 1 so gap_count is preserved —
+// writing a bare IBR resets our gap count to 0 while every other node keeps 63, and the two ends
+// then disagree about gap timing (see the same care taken in uf_hw_bring_up).
+kern_return_t UFFireWireOHCI::ForceBusReset()
+{
+    if (!ivars->pci) return kIOReturnNotReady;
+    uint8_t phy1 = 0;
+    kern_return_t r = phy_read(ivars->pci, ivars->barIndex, PHY_REG_RESET, &phy1);
+    if (r != kIOReturnSuccess) return r;
+    os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: FORCED bus reset (phy1=0x%02x)", phy1);
+    return phy_write(ivars->pci, ivars->barIndex, PHY_REG_RESET,
+                     (uint8_t)((phy1 & ~0x3f) | 0x3f | PHY_IBR));
+}
+
 // DIAGNOSTIC: log every inbound async request the FF800 (or any peer) sends us — the host-node
 // probe we are trying to detect. Walks the AR-request buffer from a private cursor and os_logs each
 // packet's tcode + source node + 48-bit target address (+ read length). tcodes: 0=wq 1=wb 4=rq 5=rb.
@@ -1566,6 +1587,30 @@ kern_return_t UFFireWireOHCI::DebugPollInbound()
 // Drain MIDI bytes received since the last poll. Walks the AR-request buffer from our read cursor to
 // wherever the controller has written (buffer size - res_count), parsing async write requests to our
 // MIDI region and unpacking one byte per quadlet (little-endian, low 8 bits).
+// Re-arm the AR REQUEST context from a known-aligned start. Used both when the controller has
+// filled the buffer and when our walk loses packet alignment — in either case the only safe resume
+// point is a fresh descriptor, because a desynced cursor cannot be repaired by guessing.
+//
+// Stopping the context first matters: rewriting a descriptor the controller is actively consuming is
+// a race, and this path now runs while inbound traffic is arriving rather than only once it has
+// stopped.
+static void uf_arreq_rearm(UFFireWireOHCI_IVars* v)
+{
+    uf_ctx_stop(v, OHCI_AR_REQ_BASE);
+    struct ohci_descriptor* qd = (struct ohci_descriptor*)v->arReqDescCPU;
+    qd->req_count       = kARBufferBytes;
+    qd->res_count       = kARBufferBytes;   // remaining space, NOT bytes written — see bring-up
+    qd->transfer_status = 0;
+    qd->control         = (uint16_t)(DESC_INPUT_MORE | DESC_STATUS | DESC_BRANCH_ALWAYS);
+    qd->data_address    = (uint32_t)v->arReqAddr;
+    qd->branch_address  = (uint32_t)v->arReqDescAddr | 1;
+    v->arReqReadBytes = 0;
+    v->dbgArReadBytes = 0;
+    reg_write(v->pci, v->barIndex, CTX_COMMAND_PTR(OHCI_AR_REQ_BASE),
+              (uint32_t)v->arReqDescAddr | 1);
+    reg_write(v->pci, v->barIndex, CTX_CONTROL_SET(OHCI_AR_REQ_BASE), CTX_RUN);
+}
+
 kern_return_t UFFireWireOHCI::MidiInPoll(uint8_t* out, uint32_t* outCount)
 {
     const uint32_t capacity = *outCount;
@@ -1576,41 +1621,60 @@ kern_return_t UFFireWireOHCI::MidiInPoll(uint8_t* out, uint32_t* outCount)
     const uint32_t written = kARBufferBytes - qd->res_count;   // bytes the controller has filled
     const uint32_t* buf = ivars->arReqCPU;
 
+    // Walk the buffer. `desync` means we can no longer trust where packet boundaries are, which is
+    // NOT the same as "nothing left to read" and must never be handled by simply stopping: this loop
+    // used to `break` on an unrecognised tcode, which froze `off` permanently. The recycle below is
+    // gated on `off >= written`, so a frozen cursor also blocked the re-arm — and MIDI in stayed
+    // dead until the daemon was restarted. Observed on hardware with a DX7, whose continuous Active
+    // Sensing (0xFE) fills the buffer fast; the debug walker was visibly reading MIDI payload as
+    // packet headers ("addr=0xfe...") shortly before everything stopped.
     uint32_t off = ivars->arReqReadBytes;
+    bool desync = false;
     while (off + 16 <= written && n < capacity) {
         const uint32_t* h = buf + off / 4;
         const unsigned tcode = (h[0] >> 4) & 0xf;
         const uint64_t offset = ((uint64_t)(h[1] & 0xffff) << 32) | h[2];
+        uint32_t adv;
         if (tcode == 0x1 /*write block req*/) {
             const uint32_t dataLen = h[3] >> 16;
+            // header(16) + payload(padded to quadlet) + trailing status quadlet.
+            adv = 16 + ((dataLen + 3) & ~3u) + 4;
+            // A length that cannot fit is proof the header is not a header.
+            if (dataLen > kARBufferBytes || off + adv > written) { desync = true; break; }
             const uint32_t* payload = h + 4;
             if ((offset >> 32) == ivars->midiHighIndex) {
                 for (uint32_t i = 0; i * 4 < dataLen && n < capacity; ++i)
                     out[n++] = (uint8_t)(payload[i] & 0xff);
             }
-            // header(16) + payload(padded to quadlet) + trailing status quadlet.
-            off += 16 + ((dataLen + 3) & ~3u) + 4;
         } else if (tcode == 0x0 /*write quadlet req*/) {
+            adv = 16 + 4;   // quadlet-write header includes the data; + trailing status
+            if (off + adv > written) break;              // simply not all here yet — not a desync
             if ((offset >> 32) == ivars->midiHighIndex && n < capacity)
                 out[n++] = (uint8_t)(h[3] & 0xff);
-            off += 16 + 4;   // quadlet-write header includes the data; + trailing status
         } else {
-            break;   // unrecognised — stop rather than misparse the ring
+            desync = true; break;   // read/lock request, or garbage: we cannot size it
         }
+        off += adv;
     }
     ivars->arReqReadBytes = off;
+
+    if (desync) {
+        os_log(OS_LOG_DEFAULT,
+               "UFFireWireOHCI: AR-request desync at off=%u of %u — re-arming", off, written);
+        uf_arreq_rearm(ivars);
+        *outCount = n;
+        return kIOReturnSuccess;
+    }
 
     // Recycle the buffer once the controller has filled it and we have parsed everything in it.
     // The AR-request context is a SINGLE self-branching descriptor: when res_count reaches 0 the
     // controller has nowhere left to put incoming requests and simply stops accepting them, and
     // because nothing ever reset the descriptor, MIDI-in would die permanently after the first 4 KB
     // of inbound traffic and never come back. Re-arm and wake the context instead.
-    if (qd->res_count == 0 && off >= written) {
-        qd->res_count       = kARBufferBytes;
-        qd->transfer_status = 0;
-        ivars->arReqReadBytes = 0;
-        reg_write(ivars->pci, ivars->barIndex, CTX_CONTROL_SET(OHCI_AR_REQ_BASE), CTX_WAKE);
-    }
+    // Recycle once the controller has run out of room. Deliberately NOT conditioned on having
+    // parsed everything: if the buffer is full there is nowhere for new requests to go, so waiting
+    // for the cursor to catch up risks trading a few unread bytes for a permanently dead port.
+    if (qd->res_count == 0) uf_arreq_rearm(ivars);
 
     *outCount = n;
     return kIOReturnSuccess;

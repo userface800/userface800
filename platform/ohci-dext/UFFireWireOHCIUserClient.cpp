@@ -182,6 +182,8 @@ UFFireWireOHCIUserClient::ExternalMethod(uint64_t selector,
         }
         case kUFOhciDebugInbound:
             return ivars->driver->DebugPollInbound();
+        case kUFOhciForceBusReset:
+            return ivars->driver->ForceBusReset();
         case kUFOhciIsoWake: {
             // A standing subscription, not a request: we keep the completion action and re-fire it
             // on every isochronous completion interrupt, so this method never "returns" a result.

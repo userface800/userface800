@@ -71,6 +71,8 @@ public:
     // the 6-frame ones so the long-term average matches the device's true rate). Only safe on a slot
     // behind the transmit head — the daemon calls it while filling, same as IsoTxRefill. HARDWARE-GATED.
     virtual kern_return_t IsoTxSetSlotBytes(uint32_t slot, uint32_t payloadBytes) LOCALONLY;
+    // TEST HOOK: force a bus reset via the PHY, to exercise topology-change recovery on demand.
+    virtual kern_return_t ForceBusReset() LOCALONLY;
     // DIAGNOSTIC: log inbound async requests from the FF800 (host-node probe detection). HARDWARE-GATED.
     virtual kern_return_t DebugPollInbound() LOCALONLY;
     virtual kern_return_t CopyIsoBuffer(IOMemoryDescriptor ** memory) LOCALONLY;

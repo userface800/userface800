@@ -39,6 +39,11 @@ enum UFOhciMethod {
     kUFOhciPump         = 17,
     kUFOhciIsoTxSetBytes = 18, // in: scalar[0]=slot, [1]=payload bytes (clock servo: 6- vs 7-frame packet)
     kUFOhciDebugInbound = 19,  // DIAGNOSTIC: log inbound async requests from the device
+    // TEST HOOK: force a FireWire bus reset (PHY IBR). A bus reset is what happens in the field
+    // whenever the topology changes — another device plugged in, a cable nudged, something powering
+    // on — and it renumbers every node, invalidating cached node ids. Triggering it deliberately is
+    // the only way to test that path without a second FireWire device to plug in.
+    kUFOhciForceBusReset = 21,
     // ASYNC. Called once with IOConnectCallAsyncScalarMethod; the wake port then receives a message
     // every time the isochronous receive context completes a marked descriptor. Never completes in
     // the ordinary sense — it is a standing subscription, not a request. See the status page below.

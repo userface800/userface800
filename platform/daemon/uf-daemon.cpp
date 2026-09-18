@@ -81,6 +81,19 @@ static const uint64_t kTxMinLeadPkts = 8;   // 1 ms: below this we have lost the
 static std::atomic<bool> g_run{true};
 static void on_signal(int) { g_run.store(false); }
 
+// Wall-clock prefix for EVENT lines. Running under launchd the output is a file nobody is watching,
+// and "RESTART ... / no tx channel / restart FAILED" repeated 60 times tells you nothing about
+// whether that happened over five seconds or five hours. The per-second telemetry keeps its own
+// uptime stamp and is suppressed by UF_QUIET anyway, so only events need this.
+static const char* uf_now() {
+    static char buf[16];
+    time_t t = time(nullptr);
+    struct tm tm_;
+    localtime_r(&t, &tm_);
+    std::snprintf(buf, sizeof buf, "%02d:%02d:%02d", tm_.tm_hour, tm_.tm_min, tm_.tm_sec);
+    return buf;
+}
+
 // SIGUSR1 arms (or re-arms) a capture. This exists because arming via UF_CAP_WAV alone requires
 // STARTING the daemon, and a fresh session is precisely what clears the intermittent faults we are
 // trying to record — every capture taken that way came back clean by construction. With this, the
@@ -92,6 +105,10 @@ static void on_arm_capture(int) { g_armCapture.store(true); }
 // source of truth and every change rebuilds the whole conf block from it (spec/02 §2.5). Currently
 // only the clock source is reachable from CoreAudio; the rest of the shadow is what uf-set writes.
 static uf::SettingsShadow g_settings{};
+
+// Suppresses session_start's step-by-step progress chatter. Set while retrying a session that keeps
+// failing — the first attempt's output is worth having, the hundredth identical copy is not.
+static bool g_sessionQuiet = false;
 
 // ── dext helpers ──────────────────────────────────────────────────────────────────────────────
 static io_connect_t open_dext() {
@@ -377,7 +394,7 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
     // enable it last (step [5], after iso start + settle).
     { std::vector<uint32_t> ones(dbq, 1);
       wblock(conn, uf::reg::kStatus0, ones.data(), dbq);
-      std::printf("uf-daemon: [1] fetch DISABLED (0x801c0000 <- 1) during setup\n"); }
+      if (!g_sessionQuiet) std::printf("uf-daemon: [1] fetch DISABLED (0x801c0000 <- 1) during setup\n"); }
     step_pause("1: fetch disabled 0x801c0000<-1");
 
     // 0x801c0080 = OUTPUT_REC_MASK (FFADO set_hardware_output_rec writes 28 quads of (rec!=0); the
@@ -387,7 +404,7 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
         uint32_t v = getenv("UF_REC") ? (uint32_t)strtoul(getenv("UF_REC"), nullptr, 0) : 0u;
         std::vector<uint32_t> rec(dbq, v);
         wblock(conn, uf::reg::kOutputRecMask, rec.data(), dbq);
-        std::printf("uf-daemon: [1b] OUTPUT_REC_MASK 0x801c0080 <- %u x%u\n", v, dbq);
+        if (!g_sessionQuiet) std::printf("uf-daemon: [1b] OUTPUT_REC_MASK 0x801c0080 <- %u x%u\n", v, dbq);
     }
 
     // The device also accepts a 4-quadlet BLOCK write at 0xfc88f004 covering f004/f008/f00c/f010
@@ -398,7 +415,7 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
         const uint32_t q4[4] = {(dbq << 11) | rx_channel, dbq, 0u, 0u};
         uint32_t n = (uint32_t)atoi(nq); if (n < 1 || n > 4) n = 4;
         wblock(conn, uf::reg::kRxPacketFormat, q4, n);
-        std::printf("uf-daemon: [1c] 0xfc88f004 block <- %u quads {%08x,%08x,%08x,%08x}\n",
+        if (!g_sessionQuiet) std::printf("uf-daemon: [1c] 0xfc88f004 block <- %u quads {%08x,%08x,%08x,%08x}\n",
                     n, q4[0], q4[1], q4[2], q4[3]);
         usleep(20 * 1000);
     }
@@ -409,11 +426,11 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
     // UF_RATE_LATCH: standalone single-quad rate latch to 0x2_0000001c BEFORE the 3-quad init,
     // which the factory driver always does and we skip.
     if (getenv("UF_RATE_LATCH")) { wq(conn, uf::reg::kInitBankStream, rate);
-        std::printf("uf-daemon: [LED6] standalone rate latch 0x2_0000001c <- %u\n", rate); }
+        if (!g_sessionQuiet) std::printf("uf-daemon: [LED6] standalone rate latch 0x2_0000001c <- %u\n", rate); }
     // UF_MIDI_HOST: register a host async-receive address at 0x2_00000320 (snd-fireface does this
     // at probe + every reset; we never do). MidiInEnable writes (localNodeId<<16)|highIndex there.
     if (getenv("UF_MIDI_HOST")) { uint64_t a = 0x11; IOConnectCallScalarMethod(conn, kMidiInEnable, &a, 1, nullptr, nullptr);
-        std::printf("uf-daemon: [LED2] host address registered at 0x2_00000320 (MidiInEnable)\n"); }
+        if (!g_sessionQuiet) std::printf("uf-daemon: [LED2] host address registered at 0x2_00000320 (MidiInEnable)\n"); }
     { const uint32_t init[3] = {rate, (dbq << 11) | rx_channel, dbqFlag};
       wblock(conn, uf::reg::kInitBankStream, init, 3); }
     usleep(100 * 1000);
@@ -424,9 +441,12 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
         if (!rq(conn, uf::reg::kTxIsoChannel, &tx_channel)) break;
         if (tx_channel == 0xffffffff) usleep(20 * 1000);
     }
-    if (tx_channel == 0xffffffff) { std::fprintf(stderr, "uf-daemon: no tx channel\n"); return false; }
+    if (tx_channel == 0xffffffff) {
+        if (!g_sessionQuiet) std::fprintf(stderr, "uf-daemon: no tx channel\n");
+        return false;
+    }
     s.tx_channel = tx_channel;
-    std::printf("uf-daemon: STF+RxFormat+AllocTx done, device tx ch=%u\n", tx_channel);
+    if (!g_sessionQuiet) std::printf("uf-daemon: STF+RxFormat+AllocTx done, device tx ch=%u\n", tx_channel);
     step_pause("tx channel published");
 
     // Continuous capture + a blocking transmit stream, then open the session and fetch PCM. Blocking
@@ -442,7 +462,7 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
         sytInterval = (uint32_t)atoi(fp);
         fullPayload = sytInterval * dbq * 4;
         fullCount   = rate * kTxSlots / (8000u * sytInterval);
-        std::printf("uf-daemon: UF_TX_FPP=%u fullPayload=%u fullCount=%u\n", sytInterval, fullPayload, fullCount);
+        if (!g_sessionQuiet) std::printf("uf-daemon: UF_TX_FPP=%u fullPayload=%u fullCount=%u\n", sytInterval, fullPayload, fullCount);
     } else if (rate % 8000 == 0) {
         sytInterval = rate / 8000;
         fullPayload = sytInterval * dbq * 4;
@@ -467,14 +487,14 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
                 wq(conn, uf::reg::kMixerRam + (uint64_t)i * 0x100 + 0x80 + 4 * i, 0x8000);
             wq(conn, uf::reg::kMixerRam + 0x1f80 + 4 * i, 0x8000);
         }
-        std::printf("uf-daemon: [2] TotalMix routed via quadlet writes (playback->output unity + faders)\n");
+        if (!g_sessionQuiet) std::printf("uf-daemon: [2] TotalMix routed via quadlet writes (playback->output unity + faders)\n");
     }
 
     // [3] comm-start — BEFORE the iso streams, so the device is armed for playback when our transmit
     // begins. This is the ordering the device requires; we previously started the iso contexts first,
     // which left the device ignoring our playback entirely.
     wq(conn, uf::reg::kInitBankStart, 0x80000000u | dbqFlag);   // 0x0002 bank comm-start
-    std::printf("uf-daemon: [3] comm-start (fc88f00c)\n");
+    if (!g_sessionQuiet) std::printf("uf-daemon: [3] comm-start (fc88f00c)\n");
     usleep(5 * 1000);
     step_pause("3: comm-start 0x2_00000028");
 
@@ -484,7 +504,7 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
     if (!getenv("UF_NO_TX")) {
         uint64_t a[3] = {rx_channel, fullPayload, fullCount};
         IOConnectCallScalarMethod(conn, kIsoTxStart, a, 3, nullptr, nullptr);
-    } else std::printf("uf-daemon: [4] TRANSMIT SKIPPED (UF_NO_TX)\n");
+    } else if (!g_sessionQuiet) std::printf("uf-daemon: [4] TRANSMIT SKIPPED (UF_NO_TX)\n");
     std::printf("uf-daemon: [4] iso started\n");
     step_pause("4: iso streams started");
 
@@ -513,14 +533,70 @@ int main() {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    io_connect_t conn = open_dext();
-    if (!conn) { std::fprintf(stderr, "uf-daemon: dext not available\n"); return 1; }
+    // Wait for the device rather than exiting and letting launchd respawn us every
+    // ThrottleInterval. With nothing plugged in, exiting means a process spawn AND a log line every
+    // 10 seconds, forever, for a device that is simply not there — ~1 MB/day of noise that buries
+    // the events worth reading. Announce once, then poll quietly; this also picks the device up in
+    // ~2 s instead of ~10 when you plug it in.
+    //
+    // Deliberately NOT the same as the dead-connection case in restart_session, where exiting stays
+    // correct: there the process needs a FRESH handle and launchd is how it gets one. Here there is
+    // nothing to reconnect to yet.
+    //
+    // Readiness is "the FF800 answers a register read", not merely "the dext is loaded" — the dext
+    // matches the OHCI controller, which is present whenever the Thunderbolt adapter is, with or
+    // without an FF800 on the far end of the FireWire cable.
+    io_connect_t conn = 0;
+    {
+        bool announced = false, hadDext = false;
+        for (;;) {
+            conn = open_dext();
+            hadDext = (conn != 0);
+            if (conn) {
+                uint32_t probe = 0;
+                if (rq(conn, uf::reg::kStatus0, &probe)) break;   // it answers — go
+                IOServiceClose(conn);
+                conn = 0;
+            }
+            if (!g_run.load()) return 0;          // Ctrl-C / SIGTERM while waiting is not an error
+            if (!announced) {
+                std::printf("[%s] uf-daemon: waiting for the FF800 (%s)\n", uf_now(),
+                            hadDext ? "dext up, device not answering" : "dext not available");
+                std::fflush(stdout);
+                announced = true;
+            }
+            sleep(2);
+        }
+        if (announced) { std::printf("[%s] uf-daemon: device present\n", uf_now()); std::fflush(stdout); }
+    }
     g_conn = conn;
 
     // Rate via UF_RATE (default 48 kHz); CoreAudio can change it later through the shm ring.
     const uint32_t startRate = getenv("UF_RATE") ? (uint32_t)atoi(getenv("UF_RATE")) : 48000;
+    // Same treatment for a device that is present but will not start — typically "no tx channel",
+    // i.e. the FF800 is wedged and wants a power cycle. Exiting here meant launchd respawning every
+    // 10 s and rewriting the same three lines forever. Say it once, keep trying quietly, and say so
+    // again when it comes good. Whoever reads this log later gets the fault and its duration, not a
+    // thousand copies of it.
     Session ses = {};
-    if (!session_start(conn, startRate, &ses)) return 1;
+    {
+        bool announced = false;
+        for (unsigned attempt = 0; !session_start(conn, startRate, &ses); ++attempt) {
+            if (!g_run.load()) return 0;
+            if (!announced) {
+                std::fprintf(stderr,
+                    "[%s] uf-daemon: device present but the session will not start. If the log above "
+                    "says 'no tx channel' the FF800 is wedged and needs a POWER CYCLE. Retrying "
+                    "quietly every 5 s.\n", uf_now());
+                std::fflush(nullptr);
+                announced = true;
+                g_sessionQuiet = true;   // first attempt's detail is kept; the repeats are not
+            }
+            sleep(5);
+        }
+        g_sessionQuiet = false;
+        if (announced) { std::printf("[%s] uf-daemon: session started\n", uf_now()); std::fflush(stdout); }
+    }
     uint32_t rate = ses.rate, dbq = ses.dbq, rx_channel = ses.rx_channel;
     uint32_t sytInterval = ses.sytInterval, fullPayload = ses.fullPayload, fullCount = ses.fullCount;
 
@@ -737,6 +813,11 @@ int main() {
             std::printf("uf-daemon: capture ARMED ON SIGNAL — kill -USR1 %d to start it\n", getpid());
     }
 
+    uint32_t restartFailures = 0;    // consecutive failed session rebuilds (see restart_session)
+    // ~25 s at the 5 s wedge backoff: long enough that a device still settling is not given up on,
+    // short enough that a replug recovers while you are still looking at it.
+    const uint32_t kMaxRestartFailures =
+        getenv("UF_MAX_RESTART_FAILURES") ? (uint32_t)atoi(getenv("UF_MAX_RESTART_FAILURES")) : 5;
     uint64_t lastAnchorAt = 0;       // when we last published a clock anchor
     double   anchorGapMaxMs = 0.0;   // worst anchor interval this second (see the publish site)
     uint64_t playMinDepth = ~0ull;   // shallowest the playback ring got this second
@@ -747,6 +828,12 @@ int main() {
     // How long capture may stall before we call it a wedge. Comfortably longer than any scheduling
     // hiccup (the pump ticks at 1 kHz) and far shorter than a human noticing the audio has died.
     const double kWedgeMs = getenv("UF_WEDGE_MS") ? atof(getenv("UF_WEDGE_MS")) : 500.0;
+    // UF_QUIET=1 drops the once-a-second telemetry. Measured at ~600 B/s that is 2.2 MB an hour and
+    // ~52 MB a day — fine for a session you are watching, far too much for a service running from
+    // login to shutdown. EVENTS are never suppressed (session up/down, restarts, wedges, errors):
+    // those are exactly the lines worth having when something went wrong overnight.
+    const bool quiet = getenv("UF_QUIET") != nullptr;
+    const bool debugInbound = getenv("UF_DEBUG_INBOUND") != nullptr;   // see the call site
 
     // Tear the session down and bring it back up, at `newRate`. Used for a CoreAudio rate change and
     // for wedge recovery — the same operation, which is why they share this.
@@ -756,7 +843,7 @@ int main() {
     // just means the clock's slope changes, which is what a rate change IS. Everything tied to the
     // dext's cursors does reset, because IsoStartContinuous/IsoTxStart rewind those to zero.
     auto restart_session = [&](uint32_t newRate, const char* why) -> bool {
-        std::printf("uf-daemon: RESTART (%s) -> %u Hz\n", why, newRate);
+        std::printf("[%s] uf-daemon: RESTART (%s) -> %u Hz\n", uf_now(), why, newRate);
         std::fflush(stdout);
         cap->deviceRate.store(0, std::memory_order_release);   // "nothing on the wire" while we switch
         // Drop our cursors before the contexts restart. They are monotonic counts into the OLD
@@ -767,9 +854,36 @@ int main() {
         session_stop(conn, ses);
         Session next = {};
         if (!session_start(conn, newRate, &next)) {
-            std::fprintf(stderr, "uf-daemon: restart FAILED at %u Hz\n", newRate);
+            std::fprintf(stderr, "[%s] uf-daemon: restart FAILED at %u Hz\n", uf_now(), newRate);
+            // "no tx channel" is not something we can recover from: the FF800 itself is wedged and
+            // needs a power cycle. Retrying is still right (a replug DOES clear it), but repeating
+            // an identical failure forever without naming the remedy is useless to whoever reads
+            // this log later. Say it once, clearly, then stop shouting.
+            // A dead user client is the common cause and it is UNRECOVERABLE IN PLACE. Replugging
+            // the FF800 (or reinstalling the dext) re-matches the driver, so the dext gets a NEW
+            // process — and our io_connect_t still refers to the old one. Every call then fails, no
+            // amount of retrying helps, and KeepAlive cannot save us because we never exit.
+            //
+            // Re-opening the client in place would mean redoing every buffer mapping and all the
+            // session state, i.e. everything main() does at startup. Exiting is the same work with
+            // none of the risk: under launchd we are restarted within ThrottleInterval with a clean
+            // connection, which is also exactly the behaviour that makes replug work. Run by hand,
+            // the message says what happened.
+            //
+            // This is safe across sleep: the machine suspends us too, so failures do not accumulate
+            // in real time, and the dext survives a sleep/wake cycle with the same process.
+            if (++restartFailures >= kMaxRestartFailures) {
+                std::fprintf(stderr,
+                    "[%s] uf-daemon: %u consecutive restart failures — exiting so a fresh start can "
+                    "reconnect. Usually means the dext restarted (device replug or reinstall) and "
+                    "our connection to it died. Under launchd this restarts automatically.\n",
+                    uf_now(), restartFailures);
+                std::fflush(nullptr);
+                std::exit(1);
+            }
             return false;
         }
+        restartFailures = 0;
         ses = next;
         rate = ses.rate; dbq = ses.dbq; rx_channel = ses.rx_channel;
         sytInterval = ses.sytInterval; fullPayload = ses.fullPayload; fullCount = ses.fullCount;
@@ -818,7 +932,7 @@ int main() {
                 }
                 // pumpLate = ticks whose work overran the 1 ms period, so the deadline had to be
                 // resynced instead of chasing a backlog. Non-zero means the pump is not keeping up.
-                std::printf("  REAL: %.0f frames/s (mach)  %.1f frames/bus-s  bus8k=%.2f Hz  %.0f pkt/s  ring=%llu over=%u under=%u late=%llu\n",
+                if (!quiet) std::printf("  REAL: %.0f frames/s (mach)  %.1f frames/bus-s  bus8k=%.2f Hz  %.0f pkt/s  ring=%llu over=%u under=%u late=%llu\n",
                             (deviceFrames - rf0) / el, fVsBus, dct / busSec / 3072.0,
                             (consumed - rc0) / el,
                             (unsigned long long)cap->depth(), cap->overruns.load(), cap->underruns.load(),
@@ -829,7 +943,7 @@ int main() {
                 if (irqPump) {
                     struct UFOhciStatus st = {};
                     const bool ok = status_read(devStatus, &st);
-                    std::printf("  IRQ: %.0f irq/s (total %llu)  timeouts=%llu  live=%d\n",
+                    if (!quiet) std::printf("  IRQ: %.0f irq/s (total %llu)  timeouts=%llu  live=%d\n",
                                 ok ? (double)(st.irqCount - irq0) / el : 0.0,
                                 (unsigned long long)(ok ? st.irqCount : 0),
                                 (unsigned long long)wakeTimeouts, ok ? 1 : 0);
@@ -848,20 +962,20 @@ int main() {
                 // for UF_SAFETY_OFFSET_MS directly. Depth is in slots; each slot is
                 // kFramesPerSlot frames, so a minimum of N slots means roughly N x (512/rate) of
                 // margin — trim the offset toward zero margin, never past it.
-                std::printf("  ANCHOR: worst gap %.1f ms this second (nominal %.1f ms)  "
+                if (!quiet) std::printf("  ANCHOR: worst gap %.1f ms this second (nominal %.1f ms)  "
                             "HAL clock=%s seed=%llu unlocks=%u\n",
                             anchorGapMaxMs, (double)uf::shm::kAnchorFrames * 1000.0 / rate,
                             cap->halLocked.load(std::memory_order_relaxed) ? "LOCKED" : "FREE-RUN",
                             (unsigned long long)cap->halSeed.load(std::memory_order_relaxed),
                             cap->halUnlocks.load(std::memory_order_relaxed));
                 anchorGapMaxMs = 0.0;
-                std::printf("  MARGIN: play ring min=%llu slots = %.1f ms spare (under=%u)\n",
+                if (!quiet) std::printf("  MARGIN: play ring min=%llu slots = %.1f ms spare (under=%u)\n",
                             (unsigned long long)playMinDepth,
                             (double)playMinDepth * uf::shm::kFramesPerSlot * 1000.0 / rate,
                             play->underruns.load());
                 playMinDepth = ~0ull;
                 if (!txFreeRun && !getenv("UF_NO_TX"))
-                    std::printf("  TX: %.0f pkt/s  lead=%lld pkt  resync=%llu dry=%llu held=%llu (%.2f ms/s)  "
+                    if (!quiet) std::printf("  TX: %.0f pkt/s  lead=%lld pkt  resync=%llu dry=%llu held=%llu (%.2f ms/s)  "
                                 "play ring=%llu over=%u under=%u  servo=%d rate=%.1f acc=%+.2f\n",
                                 (txLastSent - tx0) / el, (long long)(txFillPkt - txLastSent),
                                 (unsigned long long)txResyncs, (unsigned long long)txDry,
@@ -893,9 +1007,14 @@ int main() {
                     cap->clockLocked.store(locked ? 1u : 0u, std::memory_order_release);
                 }
                 double upSec = double(now - toneStart) * tb.numer / tb.denom / 1e9;
-                std::printf("  STATUS @%5.1fs: SR0=%08x SR1=%08x  bit31=%d bit11=%d  master=%d\n",
+                if (!quiet) std::printf("  STATUS @%5.1fs: SR0=%08x SR1=%08x  bit31=%d bit11=%d  master=%d\n",
                             upSec, sr0v, sr1v, (sr0v >> 31) & 1, (sr0v >> 11) & 1, st.clock_master);
-                IOConnectCallScalarMethod(conn, kDebugInbound, nullptr, 0, nullptr, nullptr);  // log FF800->host probes
+                // DIAGNOSTIC ONLY — off by default. This makes the dext os_log one line per inbound
+                // packet, and inbound is not rare: a MIDI source sending Active Sensing produces
+                // 11-26 packets a second indefinitely. Left on, it writes to the unified log (and
+                // so to disk) forever, for output nobody is reading. UF_DEBUG_INBOUND=1 to enable.
+                if (debugInbound)
+                    IOConnectCallScalarMethod(conn, kDebugInbound, nullptr, 0, nullptr, nullptr);
                 if (probeOn && probePeriodic) wq(conn, probeAddr, probeVal);   // re-assert candidate each second
                 if (reclaimAt >= 0 && !reclaimed && upSec >= reclaimAt) {       // LED1: re-claim while locked
                     reclaimed = true;
@@ -925,7 +1044,7 @@ int main() {
         // ~3 bytes in a millisecond, well inside the 8 a poll returns.
         if (g_midiSrc) midi_poll_in();
 
-        if (++ticks % 1000 == 0) {
+        if (++ticks % 1000 == 0 && !quiet) {
             std::printf("  cap: %llu pkt (+%llu/s)  frames=%llu (+%llu/s)  ring=%llu over=%u under=%u\n",
                         (unsigned long long)consumed, (unsigned long long)(consumed - lastConsumed),
                         (unsigned long long)deviceFrames, (unsigned long long)(deviceFrames - lastFrames),

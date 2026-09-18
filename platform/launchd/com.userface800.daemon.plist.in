@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  UserFace800 daemon, as a per-user LaunchAgent.
+
+  An AGENT, not a daemon: it has to run inside the GUI login session, because it publishes CoreMIDI
+  endpoints that apps must see and creates the shared-memory rings coreaudiod maps. Run as a system
+  LaunchDaemon it would come up before login in a different session and neither would be visible.
+  It needs no privileges — the same as running ./build/uf-daemon by hand, which is what it replaces.
+
+  @UF_DAEMON@ / @UF_LOGDIR@ are substituted by install.sh; launchd does not expand ~ or $HOME.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.userface800.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@UF_DAEMON@</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Without this the once-a-second telemetry is ~52 MB/day. Events still log. -->
+        <key>UF_QUIET</key>
+        <string>1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it exits for any reason. The FF800 being absent IS one of those reasons, so the
+         throttle below matters: without it launchd retries a failing start as fast as it can. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Audio work: keep it out of App Nap and the efficiency-core/timer-coalescing treatment that
+         a Background process gets. The daemon also raises its own thread to the realtime class. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>@UF_LOGDIR@/uf-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>@UF_LOGDIR@/uf-daemon.log</string>
+</dict>
+</plist>
