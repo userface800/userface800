@@ -36,5 +36,12 @@ if(APPLE)
   add_subdirectory(tools)
 endif()
 
+# The TUI pulls FTXUI from the network at configure time. Optional so the driver itself never
+# depends on a download — turn it off with -DUF_BUILD_TUI=OFF if you are offline or do not want it.
+option(UF_BUILD_TUI "Build the uf-tui terminal front-end (fetches FTXUI)" ON)
+if(UF_BUILD_TUI)
+  add_subdirectory(tui)
+endif()
+
 enable_testing()
 add_subdirectory(tests)

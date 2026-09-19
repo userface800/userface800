@@ -48,6 +48,24 @@ full-scale, so this region is **not** the `{peak, rms}` pair — it looks like *
 the **peak** lives on the wire (a separate region? a different bank?) is `[?]`, as is the
 `rms_acc → dB` calibration (the `2^-55` constant and any block-average `N`, §10.1).
 
+## 10.3a Transport in the driver — `ReadBlock` `[IMPLEMENTED, UNTESTED]`
+The meter region is **254 quadlets**. Polling it a quadlet at a time at 30 fps is ~7600 AT
+transactions a second through a context that carries **one outstanding transaction at a time** and is
+shared with the daemon's own register I/O. One block read is 30. So the dext gained **tcode 0x5**
+(`kUFOhciReadBlock`, `uf_read_block`), bounded by the 4 KB AR response buffer rather than the AT
+payload buffer — 256 quadlets, against 32 for writes. It trusts the length the **device** returns
+rather than the one it asked for: a short reply padded out of a stale AR buffer would read as a stuck
+level, which is worse than an error.
+
+## 10.3b What the driver actually meters `[IMPLEMENTED]`
+Inputs and playback are computed **host-side**, from the PCM the daemon already carries
+(`platform/shared/uf_meters.hpp`). Exact, no FireWire traffic, no calibration constant. The device
+region is polled only behind `UF_METER_DEVICE` and published **raw**, because §10.3's scaling is
+still open `[?]`; publishing raw keeps the undecided constant out of the daemon.
+
+What host-side **cannot** do is the **hardware output** row: those are summed by the FF800's own DSP
+and never come back to us. That row is the device poll's reason to exist.
+
 ## 10.4 Implementation notes
 - **Reading:** the dext exposes only single-quadlet reads today, so a meter poll is `N` sequential
   `ReadQuadlet`s (as `uf-probe` does). For a real meter display, add a **block-read** selector

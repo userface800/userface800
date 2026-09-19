@@ -40,10 +40,15 @@ inline constexpr Addr kStatus0 = 0x801c0000;         // R: SR0; W: channel-mute 
 inline constexpr Addr kClockConfig = 0x801c0004;     // R/W: clock config + SR1
 inline constexpr Addr kTxIsoChannel = 0x801c0008;    // R: device-assigned tx channel (0xffffffff until ready)
 inline constexpr Addr kStatus3 = 0x801c001c;         // R: status 3
-inline constexpr Addr kOutputRecMask = 0x801c0080;   // W: output/record mask
+// W: per-output record mask — TotalMix's "Loopback" (manual §27.5). A set output's MIX is sent to
+// the recording software in place of the corresponding hardware input. 28 quadlets, block-written.
+inline constexpr Addr kOutputRecMask = 0x801c0080;
 
 // Mixer / MIDI / misc.
 inline constexpr Addr kMixerRam = 0x80080000;        // W: TotalMix matrix RAM
+// R: level meters. HARDWARE-CONFIRMED pollable. 8 bytes per channel, channel N at N*8, reading as
+// a little-endian u64 accumulator whose absolute scaling is still open (spec/10 §10.3).
+inline constexpr Addr kMeterBase = 0x80100000;
 inline constexpr Addr kMidiOut = 0x80180000;         // W: MIDI out (host->device), 1 byte/LE quadlet
 inline constexpr Addr kMidiHighAddr = 0x200000320;   // W: MIDI host-receive high-addr register
 inline constexpr Addr kFirmwareRev = 0x200000100;    // R: firmware revision

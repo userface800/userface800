@@ -14,11 +14,13 @@
 #include <IOKit/IOKitLib.h>
 #include <CoreMIDI/CoreMIDI.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <cmath>
 #include <atomic>
@@ -27,6 +29,7 @@
 #include <mach/mach_port.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
+#include <map>
 #include <thread>
 
 #include "uf/protocol/channels.hpp"
@@ -42,11 +45,18 @@
 #include "../shared/uf_control.hpp"
 #include "../shared/uf_shm_ring.hpp"
 #include "../shared/uf_tx_fill.hpp"
+#include "../shared/uf_meters.hpp"
+#include "../shared/uf_mixer_model.hpp"
+#include "../shared/uf_mixer_shadow.hpp"
+#include "uf_ctl_server.hpp"
+#include "../shared/uf_state_store.hpp"
+#include "../shared/uf_state_shm.hpp"
 
 // Short names for the user-client ABI. Defined in terms of the shared header rather than copied out
 // of it, so the two cannot drift.
 #include "../ohci-dext/UFFireWireOHCIShared.h"
 enum { kRQ = kUFOhciReadQuadlet, kWQ = kUFOhciWriteQuadlet, kWB = kUFOhciWriteBlock,
+       kRB = kUFOhciReadBlock,
        kIsoStart = kUFOhciIsoStart, kIsoPoll = kUFOhciIsoPoll, kIsoStop = kUFOhciIsoStop,
        kIsoTxStart = kUFOhciIsoTxStart, kIsoTxStop = kUFOhciIsoTxStop,
        kIsoStartCont = kUFOhciIsoStartCont, kIsoCompleted = kUFOhciIsoCompleted,
@@ -106,6 +116,51 @@ static void on_arm_capture(int) { g_armCapture.store(true); }
 // only the clock source is reachable from CoreAudio; the rest of the shadow is what uf-set writes.
 static uf::SettingsShadow g_settings{};
 
+// What the mixer matrix is SUPPOSED to contain. The device forgets it on every session start, so the
+// shadow is the source of truth and the hardware is a write target — the same relationship
+// SettingsShadow already has with the write-only control registers. Without this, any route set with
+// uf-mix died at the next rate change, wedge recovery or bus reset.
+// Two layers, and the split matters. g_model is what the USER means — per-crosspoint gain plus mute
+// and phase flags, per-output loopback, stereo pairing — and g_mixer is what the DEVICE gets, the
+// 2048 rendered quadlets. Mute is why: rendering a muted crosspoint writes 0, so if 0 were all we
+// kept, un-muting could not restore the gain. See uf_mixer_model.hpp.
+static uf::MixerModel g_model{};
+static uf::MixerShadow g_mixer{};
+static bool g_mixerInit = false;
+
+// Persisting the model. The pump owns it and is the only writer, so it takes the SNAPSHOT
+// (a memcpy — no syscall, safe in the realtime loop) and a saver thread does the file I/O. Reading
+// the live model from another thread would risk writing a torn matrix to disk, which would come
+// back as unknown gains on someone's outputs at the next start.
+static uf::MixerModel::Blob g_stateSnap{};
+static std::atomic<uint64_t> g_stateSnapSeq{0};   // pump bumps after filling g_stateSnap
+static std::atomic<bool> g_stateRun{true};
+
+// Copy the mixer into the published state: the rendered matrix, the logical gains and flags above
+// it, and the stereo pairing. One place, because a UI that saw `cells` updated but the flags stale
+// would draw a mute that is not there — and a muted crosspoint renders to 0, so the flags are the
+// only way to tell "muted at -6 dB" from "faded to nothing".
+static_assert(uf::state::Shared::kMixerCh == uf::MixerModel::kCh, "published mixer geometry");
+static void publish_mixer(uf::state::Shared* o) {
+    constexpr uint32_t kCh = uf::MixerModel::kCh;
+    for (uint32_t i = 0; i < uf::state::kCells; ++i) o->cells[i] = g_mixer.cell(i);
+    for (uint32_t sc = 0; sc < kCh; ++sc)
+        for (uint32_t d = 0; d < kCh; ++d) {
+            const auto& ci = g_model.cell(uf::MixerSrcKind::Input, sc, d);
+            const auto& cp = g_model.cell(uf::MixerSrcKind::Playback, sc, d);
+            o->inputFlags[sc * kCh + d]    = ci.flags;
+            o->inputGain[sc * kCh + d]     = ci.gain;
+            o->playbackFlags[sc * kCh + d] = cp.flags;
+            o->playbackGain[sc * kCh + d]  = cp.gain;
+        }
+    for (uint32_t x = 0; x < kCh; ++x) {
+        o->outputFlags[x] = g_model.output(x).flags;
+        o->outputGain[x]  = g_model.output(x).gain;
+    }
+    o->stereoIn = g_model.stereo_bits(uf::MixerSrcKind::Input);
+    o->stereoPb = g_model.stereo_bits(uf::MixerSrcKind::Playback);
+}
+
 // Suppresses session_start's step-by-step progress chatter. Set while retrying a session that keeps
 // failing — the first attempt's output is worth having, the hundredth identical copy is not.
 static bool g_sessionQuiet = false;
@@ -132,6 +187,15 @@ static bool wq(io_connect_t c, uint64_t off, uint32_t v) {
 static bool wblock(io_connect_t c, uint64_t off, const uint32_t* q, uint32_t n) {
     return IOConnectCallMethod(c, kWB, &off, 1, q, n * 4, nullptr, nullptr, nullptr, nullptr)
            == KERN_SUCCESS;
+}
+// Block READ. One round trip for a whole region — the meters are 254 quadlets, and reading those a
+// quadlet at a time would put thousands of transactions a second through the dext's single AT
+// context (UFFireWireOHCIShared.h).
+static bool rblock(io_connect_t c, uint64_t off, uint32_t* q, uint32_t n) {
+    uint64_t in[2] = {off, n};
+    size_t bytes = n * 4;
+    return IOConnectCallMethod(c, kRB, in, 2, nullptr, 0, nullptr, nullptr, q, &bytes)
+           == KERN_SUCCESS && bytes == n * 4;
 }
 static bool call1(io_connect_t c, uint32_t sel, uint64_t a) {
     return IOConnectCallScalarMethod(c, sel, &a, 1, nullptr, nullptr) == KERN_SUCCESS;
@@ -344,6 +408,82 @@ static void session_stop(io_connect_t conn, const Session& s) {
     { const uint32_t blob[3] = {0u, 0u, 0u}; wblock(conn, uf::reg::kInitBankStop, blob, 3); }
 }
 
+// Bring the mixer model up once per daemon lifetime: defaults, then whatever was saved over the
+// top. Called early in session_start because BOTH the matrix and the output-record (loopback) mask
+// are re-applied from it, and the mask is written first.
+static void mixer_init_once(uint32_t dbq) {
+    if (g_mixerInit) return;
+    g_model.reset_defaults(dbq, getenv("UF_NODIAG") == nullptr);
+    // Restore a previously saved mixer over the defaults. Absent, truncated or an unknown
+    // version all mean "carry on with defaults" — see uf_state_store.hpp for why guessing at
+    // an unrecognised file is worse than ignoring it.
+    //
+    // A v1 file holds the rendered matrix from before the model existed; it is adopted
+    // rather than discarded, so this upgrade does not cost anyone their routing.
+    union { uf::MixerModel::Blob blob; uint32_t cells[uf::MixerShadow::kCells]; } saved{};
+    uint32_t bytes = 0;
+    const uint32_t ver = uf::load_blob(uf::state_path(), &saved, sizeof saved, &bytes);
+    if (ver == uf::kStateVersion && bytes == sizeof(uf::MixerModel::Blob)) {
+        g_model.from_blob(saved.blob);
+    } else if (ver == uf::kStateVersionCells) {
+        g_model.import_cells(saved.cells, bytes / 4);
+    }
+    if (ver && !g_sessionQuiet)
+        std::printf("uf-daemon: mixer state restored from %s (v%u)\n",
+                    uf::state_path().c_str(), ver);
+    g_mixerInit = true;
+}
+
+// Apply control commands with NO DEVICE PRESENT: model, published state and disk only.
+//
+// A cut-down twin of the pump's drain, and deliberately not shared with it — the pump's version has
+// to coalesce, rate-limit and push register writes, none of which mean anything here. What matters
+// is that both keep the model as the single source of truth, so whatever is set while waiting is
+// exactly what session_start applies when the device turns up.
+static void drain_ctl_idle(uf::CtlQueue& q, uf::state::Shared* pub) {
+    uf::CtlCommand c;
+    bool dirty = false;
+    while (q.pop(&c)) {
+        const auto kind = (uf::MixerSrcKind)c.srcKind;
+        switch (c.type) {
+            case uf::ctl::MsgType::SetMixer:
+                g_model.cell(kind, c.src, c.dest).gain = c.coeff; break;
+            case uf::ctl::MsgType::SetFader:
+                g_model.output(c.out).gain = c.coeff; break;
+            case uf::ctl::MsgType::SetCellFlags: {
+                auto& f = g_model.cell(kind, c.src, c.dest).flags;
+                f = (uint8_t)((f & ~c.mask) | (c.flags & c.mask));
+                break;
+            }
+            case uf::ctl::MsgType::SetOutFlags: {
+                auto& f = g_model.output(c.out).flags;
+                f = (uint8_t)((f & ~c.mask) | (c.flags & c.mask));
+                break;
+            }
+            case uf::ctl::MsgType::SetStereo:
+                g_model.set_stereo(kind, c.src, c.on != 0); break;
+            case uf::ctl::MsgType::Submix:
+                if (c.on) g_model.clear_submix(c.dest); else g_model.copy_submix(c.src, c.dest);
+                break;
+            case uf::ctl::MsgType::SetSettings:
+                // Adopted, not written: the conf block needs a device. session_start assembles it
+                // from g_settings, so this arrives with the session.
+                g_settings = c.settings;
+                break;
+            default: continue;
+        }
+        dirty = true;
+    }
+    if (!dirty) return;
+    g_model.render(g_mixer);
+    g_stateSnap = g_model.to_blob();
+    g_stateSnapSeq.fetch_add(1, std::memory_order_release);
+    if (pub) uf::state::publish(pub, [](uf::state::Shared* o) {
+        publish_mixer(o);
+        o->settings = g_settings;
+    });
+}
+
 static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
     if (!uf::is_supported_rate(rate)) {
         std::fprintf(stderr, "uf-daemon: unsupported rate %u\n", rate);
@@ -400,11 +540,21 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
     // 0x801c0080 = OUTPUT_REC_MASK (FFADO set_hardware_output_rec writes 28 quads of (rec!=0); the
     // factory driver writes the same 28-quadlet block). We have NEVER written this. It is the one
     // playback-side register both reference drivers touch and we don't.
+    //
+    // Now driven by the mixer model: this register IS TotalMix's Loopback (manual §27.5), one flag
+    // per hardware output, so it has to be re-applied on every session start alongside the matrix or
+    // a rate change silently drops the user's loopbacks. UF_REC still forces every output on.
+    mixer_init_once(dbq);
     if (!getenv("UF_REC_SKIP")) {
-        uint32_t v = getenv("UF_REC") ? (uint32_t)strtoul(getenv("UF_REC"), nullptr, 0) : 0u;
-        std::vector<uint32_t> rec(dbq, v);
+        std::vector<uint32_t> rec(dbq, 0);
+        if (getenv("UF_REC")) {
+            rec.assign(dbq, (uint32_t)strtoul(getenv("UF_REC"), nullptr, 0));
+        } else {
+            const auto m = g_model.rec_mask();
+            for (uint32_t i = 0; i < dbq && i < m.size(); ++i) rec[i] = m[i];
+        }
         wblock(conn, uf::reg::kOutputRecMask, rec.data(), dbq);
-        if (!g_sessionQuiet) std::printf("uf-daemon: [1b] OUTPUT_REC_MASK 0x801c0080 <- %u x%u\n", v, dbq);
+        if (!g_sessionQuiet) std::printf("uf-daemon: [1b] OUTPUT_REC_MASK 0x801c0080 <- %u x%u\n", rec[0], dbq);
     }
 
     // The device also accepts a 4-quadlet BLOCK write at 0xfc88f004 covering f004/f008/f00c/f010
@@ -477,17 +627,17 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
     // FF800 layout (ffado set_hardware_mixergain): per-output block 0x100; playback src at +0x80+4*src;
     // output fader block at 0x1f80. Unity = 0x8000, mute = 0. (Before comm-start.)
     if (!getenv("UF_MIXER_SKIP")) {
-        // FFADO writes the mixer RAM one QUADLET at a time (writeRegister per cell); the FF800 mixer
-        // may ignore block writes, which would leave the matrix full of power-on garbage that the
-        // unmuted outputs then play (the beep). Zero every cell with quadlet writes.
-        for (uint32_t off = 0; off < 0x2000; off += 4)
-            wq(conn, uf::reg::kMixerRam + off, 0);
-        for (uint32_t i = 0; i < dbq && i < 28; ++i) {
-            if (!getenv("UF_NODIAG"))
-                wq(conn, uf::reg::kMixerRam + (uint64_t)i * 0x100 + 0x80 + 4 * i, 0x8000);
-            wq(conn, uf::reg::kMixerRam + 0x1f80 + 4 * i, 0x8000);
-        }
-        if (!g_sessionQuiet) std::printf("uf-daemon: [2] TotalMix routed via quadlet writes (playback->output unity + faders)\n");
+        // Re-apply THE SHADOW, not a hardcoded default. On the first session it holds the defaults,
+        // so behaviour is unchanged; on every session after — rate change, wedge recovery, bus reset
+        // — it still holds whatever routes the user has since set, which is the entire point.
+        //
+        // Still one QUADLET per cell: FFADO writes the mixer that way and the FF800 may ignore block
+        // writes, which would leave the matrix full of power-on garbage the unmuted outputs then
+        // play (the original beep). Every cell is written even where we believe it is zero, because
+        // the device's RAM is garbage until we say otherwise.
+        g_model.render(g_mixer);
+        g_mixer.apply_all([&](uf::Addr a, uint32_t v) { wq(conn, a, v); });
+        if (!g_sessionQuiet) std::printf("uf-daemon: [2] TotalMix matrix applied from the shadow\n");
     }
 
     // [3] comm-start — BEFORE the iso streams, so the device is armed for playback when our transmit
@@ -533,6 +683,86 @@ int main() {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
+    // Control socket, up BEFORE we even look for the device. Front-ends (uf-mix, uf-set, the TUI)
+    // send commands here instead of opening their own dext client — which also removes the
+    // AT-context collision, since the dext serialises nothing and two user clients issuing register
+    // transactions can interleave.
+    //
+    // Deliberately first: a UI has to be able to connect and show state while the daemon is still
+    // waiting for hardware, not be refused until streaming starts. Commands arriving before the
+    // device exists WAIT IN THE QUEUE — the pump has not started, so nothing folds them into the
+    // shadow yet — and are applied in order once it does. Beyond kSlots the oldest are dropped,
+    // which is the right trade for a state-set command. Failure to bind is non-fatal: audio does not
+    // depend on the control plane.
+    uf::CtlQueue ctlQueue;
+    uf::CtlServer ctlServer;
+    ctlServer.start(&ctlQueue);
+
+    // Published state, for anything that wants to READ what the device is doing (uf-status and the
+    // TUI today, a GUI later). Separate from the audio ring on purpose: growing that would change its
+    // ABI and force the AudioServerPlugIn to be rebuilt in lockstep for data it does not use.
+    uf::state::Shared* pubState = nullptr;
+    {
+        // Unlink any previous segment FIRST. macOS lets a POSIX shm object be ftruncate'd exactly
+        // ONCE, at creation — so a stale segment left by an older build (a different struct size)
+        // can never be resized, ftruncate fails with EINVAL, and state publication silently stops.
+        // Unlinking costs nothing: existing readers keep their mapping, new ones get the new object.
+        shm_unlink(uf::state::kName);
+        int fd = shm_open(uf::state::kName, O_CREAT | O_RDWR, 0666);
+        if (fd >= 0) {
+            if (ftruncate(fd, sizeof(uf::state::Shared)) == 0) {
+                void* p = mmap(nullptr, sizeof(uf::state::Shared), PROT_READ | PROT_WRITE,
+                               MAP_SHARED, fd, 0);
+                if (p != MAP_FAILED) { pubState = (uf::state::Shared*)p; pubState->init(); }
+            }
+            close(fd);
+        }
+        if (!pubState)
+            std::fprintf(stderr, "uf-daemon: could not publish state shm: %s (non-fatal — "
+                                 "control still works, but UIs cannot read state)\n", strerror(errno));
+    }
+
+    // Saver thread. Writes the mixer state to disk when it has been STABLE for a moment, rather than
+    // on every change: dragging a fader produces a stream of updates and there is no reason to touch
+    // the SSD for each one. It only ever reads g_stateSnap, which the pump fills, so it can never
+    // observe a half-updated matrix.
+    std::thread stateSaver([&] {
+        uint64_t seen = 0, lastSeq = 0;
+        int stable = 0;
+        while (g_stateRun.load(std::memory_order_relaxed)) {
+            usleep(250 * 1000);
+            const uint64_t seq = g_stateSnapSeq.load(std::memory_order_acquire);
+            if (seq != lastSeq) { lastSeq = seq; stable = 0; continue; }   // still changing: wait
+            if (seq == seen || seq == 0) continue;                        // nothing new to write
+            if (++stable < 4) continue;                                   // ~1 s of quiet
+            ::mkdir(uf::state_dir().c_str(), 0755);                       // harmless if it exists
+            if (uf::save_blob(uf::state_path(), &g_stateSnap, sizeof g_stateSnap)) seen = seq;
+        }
+    });
+
+    // EVERY exit path goes through this, including the early returns in the wait loops below.
+    //
+    // The final save and the join used to sit inline at the end of main, which meant a SIGTERM
+    // arriving while the daemon was still waiting for hardware skipped both — and a std::thread
+    // destroyed while joinable calls std::terminate, so the daemon ABORTED (SIGABRT, "libc++abi:
+    // terminating") on every such shutdown, silently losing whatever had been set since the saver
+    // last ran. It is in the log dozens of times.
+    //
+    // The save is here rather than only in the saver thread because the saver waits for a second of
+    // quiet before writing: a change made just before shutdown would otherwise be lost exactly when
+    // someone expects it to have been remembered.
+    struct SaverGuard {
+        std::thread& t;
+        ~SaverGuard() {
+            if (g_stateSnapSeq.load(std::memory_order_acquire)) {
+                ::mkdir(uf::state_dir().c_str(), 0755);
+                uf::save_blob(uf::state_path(), &g_stateSnap, sizeof g_stateSnap);
+            }
+            g_stateRun.store(false);
+            if (t.joinable()) t.join();
+        }
+    } saverGuard{stateSaver};
+
     // Wait for the device rather than exiting and letting launchd respawn us every
     // ThrottleInterval. With nothing plugged in, exiting means a process spawn AND a log line every
     // 10 seconds, forever, for a device that is simply not there — ~1 MB/day of noise that buries
@@ -546,6 +776,26 @@ int main() {
     // Readiness is "the FF800 answers a register read", not merely "the dext is loaded" — the dext
     // matches the OHCI controller, which is present whenever the Thunderbolt adapter is, with or
     // without an FF800 on the far end of the FireWire cable.
+    // Bring the mixer model up NOW, before the device is even known to exist.
+    //
+    // It used to happen at the first session start, which meant that with no device attached the
+    // daemon had no model, published none, and drained no commands: a UI showed factory defaults
+    // while the user set routes, and those commands sat in the queue until a session began (or fell
+    // out of it — the queue drops the oldest when full). The mixer is state the daemon owns; it does
+    // not need hardware to exist, only to be applied.
+    //
+    // 28 rather than the session's channel count on purpose: the model deliberately persists across
+    // rate changes, so which rate the daemon happened to start at should not decide how much of it
+    // is populated. Cells beyond the current rate's channel count are simply not on the wire.
+    mixer_init_once(uf::MixerModel::kCh);
+    // Publish it straight away, so a UI attaching before any device or any edit sees the routing it
+    // will actually get rather than an empty matrix.
+    g_model.render(g_mixer);
+    if (pubState) uf::state::publish(pubState, [&](uf::state::Shared* o) {
+        publish_mixer(o);
+        o->settings = g_settings;
+    });
+
     io_connect_t conn = 0;
     {
         bool announced = false, hadDext = false;
@@ -559,17 +809,27 @@ int main() {
                 conn = 0;
             }
             if (!g_run.load()) return 0;          // Ctrl-C / SIGTERM while waiting is not an error
+            // Keep serving clients while we wait. Nothing can be written to a device that is not
+            // there, but the model can be updated, published and saved — and session_start applies
+            // the whole matrix anyway, so a route set now simply arrives when the device does.
             if (!announced) {
                 std::printf("[%s] uf-daemon: waiting for the FF800 (%s)\n", uf_now(),
                             hadDext ? "dext up, device not answering" : "dext not available");
                 std::fflush(stdout);
                 announced = true;
             }
-            sleep(2);
+            // Probe for the device every 2 s, but serve clients eight times as often: a UI whose
+            // edits took two seconds to appear would feel broken, and there is no reason to couple
+            // how fast we answer a person to how fast we poll for hardware.
+            for (int i = 0; i < 8 && g_run.load(); ++i) {
+                drain_ctl_idle(ctlQueue, pubState);
+                usleep(250 * 1000);
+            }
         }
         if (announced) { std::printf("[%s] uf-daemon: device present\n", uf_now()); std::fflush(stdout); }
     }
     g_conn = conn;
+
 
     // Rate via UF_RATE (default 48 kHz); CoreAudio can change it later through the shm ring.
     const uint32_t startRate = getenv("UF_RATE") ? (uint32_t)atoi(getenv("UF_RATE")) : 48000;
@@ -760,6 +1020,19 @@ int main() {
     // what caused the 192 kHz ring modulation, and it went unfound for days precisely because
     // nothing could reach it from a test.
     uf::TxFill txSrc(dbq);
+
+    // Level meters. Accumulated from the PCM we already handle, so they cost no FireWire traffic and
+    // need no calibration constant (uf_meters.hpp); the device's own meter region is polled
+    // separately below, raw, because its scaling is still open.
+    uf::MeterBank<uf::shm::kMaxChannels> inMeters, pbMeters;
+    uint64_t meterNextNs = 0;
+    // ~30 Hz. Faster buys nothing a person can see, and every publish bumps the state seqlock that
+    // UIs read the matrix through.
+    static const uint64_t kMeterPeriodNs = 33'000'000;
+    // The device meter poll is OFF unless asked for. It is the only metering that costs a FireWire
+    // transaction, and until spec/10 §10.3's calibration is settled the numbers it publishes are raw
+    // — useful for working that out, not yet for drawing a bar.
+    const bool meterDevice = getenv("UF_METER_DEVICE") != nullptr;
     const bool txFreeRun = getenv("UF_TX_FREERUN") != nullptr;   // A/B against the old free-running fill
     const bool txPaced   = !txFreeRun && !getenv("UF_NO_TX");
     // Clock servo. The FF800 fetches playback at its own crystal (~48002), we deliver a base 48000
@@ -813,6 +1086,13 @@ int main() {
             std::printf("uf-daemon: capture ARMED ON SIGNAL — kill -USR1 %d to start it\n", getpid());
     }
 
+    // Cells changed by control commands but not yet pushed to the device. A map, so repeated writes
+    // to the same cell collapse to one — the whole point of coalescing.
+    std::map<uf::Addr, uint32_t> ctlDirty;
+    // Set by changes that touch no device register (stereo pairing) but must still be saved and
+    // republished, so they are not lost just because nothing needed writing.
+    bool stateDirty = false;
+    static const uint32_t kCtlWritesPerTick = 8;
     uint32_t restartFailures = 0;    // consecutive failed session rebuilds (see restart_session)
     // ~25 s at the 5 s wedge backoff: long enough that a device still settling is not given up on,
     // short enough that a replug recovers while you are still looking at it.
@@ -969,6 +1249,16 @@ int main() {
                             (unsigned long long)cap->halSeed.load(std::memory_order_relaxed),
                             cap->halUnlocks.load(std::memory_order_relaxed));
                 anchorGapMaxMs = 0.0;
+                if (pubState) uf::state::publish(pubState, [&](uf::state::Shared* o) {
+                    o->deviceRate  = cap->deviceRate.load(std::memory_order_relaxed);
+                    o->clockSource = cap->clockSource.load(std::memory_order_relaxed);
+                    o->clockLocked = cap->clockLocked.load(std::memory_order_relaxed);
+                    o->dbq         = dbq;
+                    o->settings    = g_settings;
+                    // Also every second, not only on change: a UI started after the last edit would
+                    // otherwise attach to a matrix of zeros and show an empty mixer.
+                    publish_mixer(o);
+                });
                 if (!quiet) std::printf("  MARGIN: play ring min=%llu slots = %.1f ms spare (under=%u)\n",
                             (unsigned long long)playMinDepth,
                             (double)playMinDepth * uf::shm::kFramesPerSlot * 1000.0 / rate,
@@ -1038,6 +1328,144 @@ int main() {
             capWavDone = false;
             std::printf("uf-daemon: capture STARTED (%.1f s to %s)\n", capWavSecs, capWavPath);
             std::fflush(stdout);
+        }
+
+        // Apply control commands, COALESCED. Every mixer write is a FireWire register write, and the
+        // dext runs one outstanding AT transaction at a time, poll-based, shared with our own
+        // register I/O — so ~1000 automation updates/s would saturate it. Fold the queue into the
+        // shadow first (last value per cell wins), then push at most kCtlWritesPerTick cells to the
+        // device. At 1 kHz that is still far more than the ~30-50 Hz past which a fader ride is
+        // indistinguishable, and a burst of automation costs a bounded number of writes.
+        {
+            uf::CtlCommand c;
+            while (ctlQueue.pop(&c)) {
+                // Every path updates the MODEL, then renders the cells it touched. Rendering in
+                // one place is what keeps "set one cell" and "re-apply everything" from disagreeing
+                // about how a mute or a phase flip turns into a quadlet.
+                const auto kind = (uf::MixerSrcKind)c.srcKind;
+                auto dirty = [&](uf::MixerModel::Write w) {
+                    g_mixer.set_at(w.addr, w.value);
+                    ctlDirty[w.addr] = w.value;      // last write to a cell wins — the coalescing
+                };
+                switch (c.type) {
+                    case uf::ctl::MsgType::SetMixer:
+                        g_model.cell(kind, c.src, c.dest).gain = c.coeff;
+                        dirty(g_model.render_cell(kind, c.src, c.dest));
+                        continue;
+                    case uf::ctl::MsgType::SetFader:
+                        g_model.output(c.out).gain = c.coeff;
+                        dirty(g_model.render_output(c.out));
+                        continue;
+                    case uf::ctl::MsgType::SetCellFlags: {
+                        auto& f = g_model.cell(kind, c.src, c.dest).flags;
+                        f = (uint8_t)((f & ~c.mask) | (c.flags & c.mask));
+                        dirty(g_model.render_cell(kind, c.src, c.dest));
+                        continue;
+                    }
+                    case uf::ctl::MsgType::SetOutFlags: {
+                        auto& f = g_model.output(c.out).flags;
+                        const bool wasRec = (f & uf::kMfRec) != 0;
+                        f = (uint8_t)((f & ~c.mask) | (c.flags & c.mask));
+                        dirty(g_model.render_output(c.out));
+                        // Loopback lives in a different register from the matrix — the 28-quadlet
+                        // output-record mask — and it is written as a block, so a change costs one
+                        // extra write, and only when the flag actually moved.
+                        if (wasRec != ((f & uf::kMfRec) != 0)) {
+                            const auto m = g_model.rec_mask();
+                            std::vector<uint32_t> rec(dbq, 0);
+                            for (uint32_t i = 0; i < dbq && i < m.size(); ++i) rec[i] = m[i];
+                            wblock(conn, uf::reg::kOutputRecMask, rec.data(), dbq);
+                        }
+                        continue;
+                    }
+                    case uf::ctl::MsgType::SetStereo:
+                        // Host-side only: nothing to write to the device, but it is published and
+                        // persisted so every front-end agrees and it survives a restart.
+                        g_model.set_stereo(kind, c.src, c.on != 0);
+                        stateDirty = true;
+                        continue;
+                    case uf::ctl::MsgType::Submix: {
+                        if (c.on) g_model.clear_submix(c.dest);
+                        else      g_model.copy_submix(c.src, c.dest);
+                        // A column is 28 inputs + 28 playbacks. They go through the same coalescing
+                        // and rate limit as everything else, so a submix copy lands over a few ms
+                        // rather than blocking the pump for 56 register writes in one tick.
+                        for (uint32_t sc = 0; sc < uf::MixerModel::kCh; ++sc) {
+                            dirty(g_model.render_cell(uf::MixerSrcKind::Input, sc, c.dest));
+                            dirty(g_model.render_cell(uf::MixerSrcKind::Playback, sc, c.dest));
+                        }
+                        continue;
+                    }
+                    case uf::ctl::MsgType::SetSettings: {
+                        // Adopt the shadow, then write it. Adopting is what makes it stick: the next
+                        // session_start re-assembles the conf block from g_settings, so a setting
+                        // written straight to the register (as uf-set used to) was silently undone
+                        // by the next rate change — the same bug the mixer had.
+                        g_settings = c.settings;
+                        uf::ConfBlock cb = uf::assemble_conf_block(g_settings);
+                        const uint32_t conf[3] = {cb.cr0, cb.cr1, cb.cr2};
+                        wblock(conn, uf::reg::kConfBlock, conf, 3);
+                        wq(conn, uf::reg::kClockConfig,
+                           uf::assemble_clock_config(g_settings.clock_master, g_settings.sync_ref,
+                                                     c.rate ? c.rate : rate));
+                        if (pubState) uf::state::publish(pubState, [&](uf::state::Shared* o) {
+                            o->settings = g_settings;
+                        });
+                        continue;                        // not a mixer cell: nothing to coalesce
+                    }
+                    default: continue;
+                }
+            }
+            uint32_t written = 0;
+            for (auto it = ctlDirty.begin(); it != ctlDirty.end() && written < kCtlWritesPerTick; ) {
+                wq(conn, it->first, it->second);
+                it = ctlDirty.erase(it);
+                ++written;
+            }
+            if (written || stateDirty) {
+                stateDirty = false;
+                // Hand the saver thread a consistent copy. A struct copy, no syscall — the file
+                // write itself happens off this thread.
+                g_stateSnap = g_model.to_blob();
+                g_stateSnapSeq.fetch_add(1, std::memory_order_release);
+                // Republish so a UI sees its own change reflected rather than waiting a second.
+                if (pubState) uf::state::publish(pubState, publish_mixer);
+            }
+        }
+
+        // Meters, ~30 Hz. Taking the accumulators also resets them, so the RMS window is exactly the
+        // interval between publishes and there is no separate window to fall out of step.
+        {
+            const uint64_t nowNs = mach_absolute_time() * tb.numer / tb.denom;
+            if (nowNs >= meterNextNs) {
+                meterNextNs = nowNs + kMeterPeriodNs;
+                uf::MeterValue inv[uf::shm::kMaxChannels], pbv[uf::shm::kMaxChannels];
+                const uint32_t frames = inMeters.frames();
+                inMeters.take(inv, uf::shm::kMaxChannels);
+                pbMeters.take(pbv, uf::shm::kMaxChannels);
+
+                // The device's own meter region, RAW. Polled at the same cadence but ONLY when it is
+                // wanted: it is the one part of metering that costs a FireWire transaction, and its
+                // scaling is still unsettled (spec/10 §10.3), so it is not on by default.
+                uint32_t devq[64] = {0};
+                bool devOk = false;
+                if (meterDevice) devOk = rblock(conn, uf::reg::kMeterBase, devq, 64);
+
+                if (pubState) uf::state::publish(pubState, [&](uf::state::Shared* o) {
+                    for (uint32_t i = 0; i < uf::state::Shared::kMixerCh; ++i) {
+                        o->inputMeters[i] = inv[i];
+                        o->playbackMeters[i] = pbv[i];
+                    }
+                    o->meterFrames = frames;
+                    if (devOk) {
+                        // Little-endian u64 per channel, as it comes off the wire — see the header.
+                        for (uint32_t i = 0; i < 32; ++i)
+                            o->deviceMeters[i] = (uint64_t)devq[i * 2] |
+                                                 ((uint64_t)devq[i * 2 + 1] << 32);
+                        ++o->deviceMeterSeq;
+                    }
+                });
+            }
         }
 
         // MIDI in. One cheap external method per tick; at 31250 baud the device can produce at most
@@ -1170,6 +1598,14 @@ int main() {
                     if (!capSlot) { capSlot = cap->acquireWrite(); capFill = 0; }
                     if (capSlot || (capWavPath && !capWavDone)) {
                         uf::decode_frame(payload + (size_t)k * dbq * 4, dbq, frame.data());
+                        // Top-justify to match the ring (and the playback side), so both meter rows
+                        // are on one scale.
+                        {
+                            int32_t up[uf::shm::kMaxChannels];
+                            const uint32_t mc = ch;
+                            for (uint32_t c = 0; c < mc; ++c) up[c] = frame[c] << 8;
+                            inMeters.add_frame(up, mc);
+                        }
                         if (capWavPath && !capWavDone) {
                             capWav.insert(capWav.end(), frame.begin(), frame.begin() + dbq);
                             if (++capWavFrames >= capWavLimit) {
@@ -1436,6 +1872,7 @@ int main() {
                         frameSrc = tone;
                     } else {
                         frameSrc = txSrc.frame(*play);
+                        pbMeters.add_frame(frameSrc, txSrc.channels());
                     }
                     uint8_t* fr = base + (size_t)f * dbq * 4;
                     for (uint32_t c = 0; c < dbq; ++c)
@@ -1474,6 +1911,8 @@ int main() {
     }
 
     std::printf("uf-daemon: stopping (%llu session restarts)\n", (unsigned long long)restarts);
+    ctlServer.stop();   // joins the listener thread and unlinks the socket, so a restart can bind
+    // The final save and the saver join happen in ~SaverGuard, so they cover the early returns too.
     if (midiClient) {
         IOConnectCallScalarMethod(conn, kUFOhciMidiInDisable, nullptr, 0, nullptr, nullptr);
         g_midiSrc = 0;
@@ -1481,6 +1920,7 @@ int main() {
     }
     cap->deviceRate.store(0, std::memory_order_release);
     session_stop(conn, ses);
+    shm_unlink(uf::state::kName);
     shm_unlink(uf::shm::kCaptureName);
     shm_unlink(uf::shm::kPlaybackName);
     IOServiceClose(conn);

@@ -22,21 +22,12 @@
 #include <cstring>
 
 #include "uf/protocol/registers.hpp"
+#include "../platform/shared/uf_ctl_client.hpp"
 #include "uf/protocol/settings.hpp"
 #include "uf/protocol/clock.hpp"
 #include "uf/protocol/rate.hpp"
 
 enum { kUFOhciReadQuadlet = 0, kUFOhciWriteQuadlet = 1, kUFOhciWriteBlock = 2 };
-
-static io_connect_t open_dext() {
-    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
-                                                  IOServiceNameMatching("UFFireWireOHCI"));
-    if (!svc) return 0;
-    io_connect_t conn = 0;
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
-    IOObjectRelease(svc);
-    return kr == KERN_SUCCESS ? conn : 0;
-}
 
 static void usage() {
     std::printf(
@@ -128,8 +119,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Assembled here only to SHOW what will be written; the daemon re-assembles it from the shadow
+    // it adopts, so these values are informational rather than the thing sent.
     uf::ConfBlock cb = uf::assemble_conf_block(s);
-    const uint32_t conf[3] = {cb.cr0, cb.cr1, cb.cr2};
     const uint32_t clkcfg = uf::assemble_clock_config(s.clock_master, s.sync_ref, rate);
 
     std::printf("clock:  %s", s.clock_master ? "internal master" : "autosync/slave");
@@ -150,18 +142,20 @@ int main(int argc, char** argv) {
                 (unsigned long long)uf::reg::kClockConfig, clkcfg);
     if (print_only) return 0;
 
-    io_connect_t conn = open_dext();
-    if (!conn) { std::fprintf(stderr, "dext user client not available\n"); return 1; }
-
-    uint64_t off = uf::reg::kConfBlock;
-    kern_return_t kr = IOConnectCallMethod(conn, kUFOhciWriteBlock, &off, 1, conf, 3 * 4,
-                                           nullptr, nullptr, nullptr, nullptr);
-    if (kr == KERN_SUCCESS) {
-        uint64_t in[2] = {uf::reg::kClockConfig, clkcfg};
-        kr = IOConnectCallScalarMethod(conn, kUFOhciWriteQuadlet, in, 2, nullptr, nullptr);
+    // Through the daemon, not straight to the device. The daemon keeps the SettingsShadow and
+    // re-assembles the conf block from it on every session start, so a register written directly
+    // here was silently undone by the next rate change — the same bug the mixer had. Going through
+    // it also means only one process ever issues register transactions, which matters because the
+    // dext serialises nothing and its single AT context is shared.
+    std::fflush(stdout);   // else the stderr below prints before the report above, when piped
+    uf::ctl::Client cli;
+    std::string err;
+    if (!cli.connect(&err, /*clientKind=*/1 /*CLI*/)) {
+        std::fprintf(stderr, "uf-set: %s\n", err.c_str());
+        return 1;
     }
-    IOServiceClose(conn);
-    if (kr != KERN_SUCCESS) { std::fprintf(stderr, "write failed: 0x%x\n", kr); return 1; }
-    std::printf("written (volatile — power cycle resets; watch the front panel)\n");
+    if (!cli.set_settings(s, rate)) { std::fprintf(stderr, "uf-set: send failed\n"); return 1; }
+    std::printf("sent (volatile on the device — a power cycle resets it, but the daemon re-applies\n"
+                "      these settings on every session start, and remembers them across restarts)\n");
     return 0;
 }

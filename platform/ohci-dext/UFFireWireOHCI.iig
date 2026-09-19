@@ -42,6 +42,9 @@ public:
     // Block write (e.g. the FF800's 3-quadlet conf block at 0xfc88f014, which the device expects as
     // one block transaction, not three quadlet writes).
     virtual kern_return_t WriteBlock(uint64_t offset, const uint32_t * quads, uint32_t count) LOCALONLY;
+    // Block read (the level-meter region at 0x80100000 is 254 quadlets; polling it one quadlet at a
+    // time would saturate the single AT context — see UFFireWireOHCIShared.h).
+    virtual kern_return_t ReadBlock(uint64_t offset, uint32_t * quads, uint32_t count) LOCALONLY;
 
     // Isochronous receive (OHCI-3): capture `packets` packets from `channel` into the shared buffer.
     virtual kern_return_t IsoStart(uint32_t channel, uint32_t packets) LOCALONLY;

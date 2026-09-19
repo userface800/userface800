@@ -48,12 +48,23 @@ enum UFOhciMethod {
     // every time the isochronous receive context completes a marked descriptor. Never completes in
     // the ordinary sense — it is a standing subscription, not a request. See the status page below.
     kUFOhciIsoWake      = 20,
+    // Block READ (tcode 0x5). in: scalar[0]=offset48, [1]=quadlet count; out: structureOutput.
+    //
+    // The FF800's level meters live at 0x80100000 and are a 1016-byte region, hardware-confirmed
+    // pollable. Reading that a quadlet at a time is not an option: 254 quadlets
+    // at 30 fps is ~7600 AT transactions a second through a context that runs ONE outstanding
+    // transaction at a time and is shared with the daemon's own register I/O. One block read is 30.
+    kUFOhciReadBlock    = 22,
     kUFOhciMethodCount
 };
 
 // Block writes carry their payload as a structure input: the conf block is 3 quadlets, but the
 // fetch-PCM-frames register takes one quadlet per playback channel (28 at single speed).
 #define kUFOhciMaxBlockQuadlets 32
+
+// Block reads are bounded by the AR response buffer (4 KB) rather than by the AT payload buffer, so
+// they get their own, larger limit. 256 quadlets = 1024 bytes covers the meter region's 254.
+#define kUFOhciMaxReadQuadlets 256
 
 // Isochronous capture: the dext DMAs each received packet into its own slot of a shared buffer, which
 // the client maps read-only (CopyClientMemoryForType type 0). A slot holds the 4-byte isochronous

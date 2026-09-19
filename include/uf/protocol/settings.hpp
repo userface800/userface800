@@ -9,7 +9,7 @@
 // CR2 FREQ0|FREQ1|DSPEED|QSSPEED (=0x1E, "hardwired in other drivers") and, via an `=`/`==`
 // assignment bug, always sets WORD_CLOCK_1x. snd-fireface (the primary reference) never writes the
 // CR block at all, and the spec/09 §9.2 vector has CR2=0x80000001. We follow snd-fireface/spec and
-// leave FREQ/speed = 0 and word_clock_1x caller-controlled; confirm on the Sonoma FF800.
+// leave FREQ/speed = 0 and word_clock_1x caller-controlled; confirm on the FF800.
 #pragma once
 #include "uf/protocol/endian.hpp"
 #include "uf/protocol/registers.hpp"
@@ -20,6 +20,29 @@ namespace uf {
 enum class InputLevel { LoGain, P4dBu, M10dBV };
 enum class OutputLevel { HiGain, P4dBu, M10dBV };
 enum class PhonesLevel { P4dBu, M10dBV, HiGain };
+
+// Names live here, beside the enums, because THE THREE ORDERINGS DIFFER — input starts at LoGain,
+// output at HiGain, phones at P4dBu. A caller that indexes one shared table gets two of the three
+// wrong, silently, and reports the wrong gain setting to the user. (Written after doing exactly
+// that in uf-status.)
+constexpr const char* level_name(InputLevel v) {
+    switch (v) { case InputLevel::LoGain: return "lo gain";
+                 case InputLevel::P4dBu:  return "+4 dBu";
+                 case InputLevel::M10dBV: return "-10 dBV"; }
+    return "?";
+}
+constexpr const char* level_name(OutputLevel v) {
+    switch (v) { case OutputLevel::HiGain: return "hi gain";
+                 case OutputLevel::P4dBu:  return "+4 dBu";
+                 case OutputLevel::M10dBV: return "-10 dBV"; }
+    return "?";
+}
+constexpr const char* level_name(PhonesLevel v) {
+    switch (v) { case PhonesLevel::P4dBu:  return "+4 dBu";
+                 case PhonesLevel::M10dBV: return "-10 dBV";
+                 case PhonesLevel::HiGain: return "hi gain"; }
+    return "?";
+}
 
 // Per-input physical source select (FF800 input options, spec/06). Unset emits no bits — matches
 // the spec/09 §9.2 vector, which omits input-option bits ("+ input-option bits as desired").

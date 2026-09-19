@@ -23,6 +23,39 @@ inline constexpr u32 kMixerMute = 0x00000;
 inline constexpr u32 kMixerUnity = 0x08000;  // 0 dB
 inline constexpr u32 kMixerMax = 0x10000;    // +6 dB
 
+// Which half of a destination's 0x100-byte block a coefficient lives in. Not a flat src x dest grid:
+// physical inputs occupy the first 0x80, playback streams the second, so "which kind of source" is
+// part of the address rather than a detail (spec/07 §7.2). TotalMix's three rows are exactly this
+// distinction — hardware inputs, software playback, hardware outputs (manual §25.2).
+enum class MixerSrcKind : u16 { Input = 0, Playback = 1 };
+
+// The coefficient is SIGNED: a NEGATIVE value inverts the phase by 180°. FFADO validates
+// `abs(val) <= 0x10000` in set_hardware_mixergain and negates the value when a crosspoint carries
+// FF_SWPARAM_MF_INVERTED; the TotalMix Matrix draws such a crosspoint red (manual §26.2). So the
+// magnitude is the gain and the sign is the phase — one quadlet carries both.
+inline constexpr i32 kMixerMinCoeff = -static_cast<i32>(kMixerMax);
+
+// Magnitude + phase -> the quadlet actually written, two's complement.
+//
+// The `magnitude == 0` special case is FFADO's, and is a hardware workaround rather than tidiness:
+// on the FF800 a transition from 0 (-inf dB) to -1 (-90 dB) makes the device run the volume far UP
+// before dropping to the set point about a tenth of a second later. Writing -1 instead of a negative
+// zero (which is just 0, and would read back as "not inverted" anyway) keeps the crosspoint on the
+// negative side and avoids crossing that boundary. Inaudible: -90 dB.
+inline constexpr i32 signed_coeff(u32 magnitude, bool inverted) {
+    if (magnitude > kMixerMax) magnitude = kMixerMax;
+    if (!inverted) return static_cast<i32>(magnitude);
+    return -static_cast<i32>(magnitude == 0 ? 1u : magnitude);
+}
+
+// The quadlet as the device stores it, and back. Separate names because a raw cast in the middle of
+// addressing code reads like a mistake.
+inline constexpr u32 coeff_quadlet(i32 coeff) { return static_cast<u32>(coeff); }
+inline constexpr i32 quadlet_coeff(u32 q) { return static_cast<i32>(q); }
+inline constexpr u32 coeff_magnitude(i32 coeff) {
+    return static_cast<u32>(coeff < 0 ? -coeff : coeff);
+}
+
 // physical input `src` -> output `dest` coefficient address (spec/07 §7.2).
 constexpr Addr input_coeff_addr(u32 src, u32 dest) {
     return reg::kMixerRam + dest * 2 * kMixerBlock + 4 * src;

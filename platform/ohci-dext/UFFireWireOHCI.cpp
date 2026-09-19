@@ -1086,6 +1086,71 @@ static kern_return_t uf_write_block(UFFireWireOHCI_IVars* v, uint16_t dest, uint
     return ret;
 }
 
+// Read a block of quadlets (tcode 0x5). Same shape as uf_read_quadlet, but the response is
+// tcode 0x7 and carries its payload after the four header quadlets.
+//
+// This exists for the level meters: 0x80100000 returns live meter data on hardware, and that region
+// is 254 quadlets. Polling it a quadlet at a time at 30 fps would be
+// ~7600 transactions a second through a context that carries one at a time.
+static kern_return_t uf_read_block(UFFireWireOHCI_IVars* v, uint16_t dest, uint64_t offset,
+                                   uint32_t speed, uint32_t* out, unsigned count)
+{
+    if (count == 0 || count > kUFOhciMaxReadQuadlets) return kIOReturnBadArgument;
+    const uint32_t bytes = count * 4;
+
+    uint32_t q[4];
+    uint8_t tl = v->tlabel++ & 0x3f;
+    // As in uf_write_block, the 4th header quadlet is data_length:16 | extended_tcode:16 — a header
+    // field, so it is not byte-swapped. A read request carries no payload of its own.
+    unsigned hq = uf_at_header(q, 0x5 /*read block req*/, tl, dest, offset, bytes << 16, speed);
+    unsigned z = ohci_build_at_block((struct ohci_descriptor*)v->atCPU, q, hq, 0, 0);
+
+    uf_ar_rearm(v);
+
+    kern_return_t ret = kIOReturnError;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        ret = uf_at_run(v, z, (z == 3) ? 2 : 0);
+        if (ret == kIOReturnSuccess) break;
+        IOSleep(10);
+        uf_ar_rearm(v);
+    }
+    if (ret != kIOReturnSuccess) return ret;
+
+    for (int i = 0; i < 100; ++i) {              // await the read-block response
+        if ((v->arCPU[0] >> 4 & 0xf) == 0x7 /*read block resp*/ &&
+            (v->arCPU[0] >> 10 & 0x3f) == tl) {
+            uint32_t rcode = (v->arCPU[1] >> 12) & 0xf;
+            if (rcode != 0) {
+                os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: read_block rcode=%u (off=0x%llx count=%u)",
+                       rcode, offset, count);
+                return kIOReturnIOError;
+            }
+            // The device is entitled to return FEWER bytes than asked for. Trust its length, not
+            // ours, or a short reply is padded with whatever the AR buffer held last time — which
+            // for meters would read as a stuck level rather than as an error.
+            const uint32_t got = (v->arCPU[3] >> 16) & 0xffff;
+            const uint32_t have = (got < bytes) ? got : bytes;
+            if (4u + have / 4u + 1u > kARBufferBytes / 4u) return kIOReturnIOError;
+            // The trailer follows the payload, so its index depends on the length the device sent.
+            const uint32_t trailer = v->arCPU[4 + (have + 3) / 4];
+            unsigned evt = (trailer >> 16) & 0x1f;
+            if (evt != 0x11 /*ack_complete*/) {
+                os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: read_block AR evt=0x%02x", evt);
+                return kIOReturnIOError;
+            }
+            // Little-endian on the wire, i.e. straight through on this host — the same reasoning as
+            // uf_read_quadlet: byte order is the protocol's business, not the transport's.
+            for (unsigned k = 0; k < count; ++k)
+                out[k] = (k * 4 < have) ? v->arCPU[4 + k] : 0;
+            return kIOReturnSuccess;
+        }
+        IOSleep(1);
+    }
+    os_log(OS_LOG_DEFAULT, "UFFireWireOHCI: read_block no resp (off=0x%llx count=%u tl=%u)",
+           offset, count, tl);
+    return kIOReturnTimeout;
+}
+
 kern_return_t UFFireWireOHCI::WriteBlock(uint64_t offset, const uint32_t* quads, uint32_t count)
 {
     if (!ivars->ff800Found) return kIOReturnNotReady;
@@ -1740,6 +1805,12 @@ kern_return_t UFFireWireOHCI::ReadQuadlet(uint64_t offset, uint32_t* value)
 {
     if (!ivars->ff800Found) return kIOReturnNotReady;
     return uf_read_quadlet(ivars, ivars->ff800Node, offset, ivars->ff800Speed, value);
+}
+
+kern_return_t UFFireWireOHCI::ReadBlock(uint64_t offset, uint32_t* quads, uint32_t count)
+{
+    if (!ivars->ff800Found) return kIOReturnNotReady;
+    return uf_read_block(ivars, ivars->ff800Node, offset, ivars->ff800Speed, quads, count);
 }
 
 kern_return_t UFFireWireOHCI::WriteQuadlet(uint64_t offset, uint32_t value)

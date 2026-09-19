@@ -232,6 +232,24 @@ UFFireWireOHCIUserClient::ExternalMethod(uint64_t selector,
             if (!quads) return kIOReturnBadArgument;
             return ivars->driver->WriteBlock(offset, quads, count);
         }
+        case kUFOhciReadBlock: {
+            if (arguments->scalarInputCount < 2 || arguments->scalarInput == nullptr)
+                return kIOReturnBadArgument;
+            const uint64_t offset = arguments->scalarInput[0];
+            const uint32_t count  = (uint32_t)arguments->scalarInput[1];
+            if (count == 0 || count > kUFOhciMaxReadQuadlets) return kIOReturnBadArgument;
+
+            uint32_t quads[kUFOhciMaxReadQuadlets];
+            kern_return_t r = ivars->driver->ReadBlock(offset, quads, count);
+            if (r != kIOReturnSuccess) return r;
+
+            // Structure output rather than scalars: 254 quadlets does not fit in the scalar array,
+            // and the point of a block read is to get the whole region in one round trip.
+            OSData* data = OSData::withBytes(quads, count * 4);
+            if (!data) return kIOReturnNoMemory;
+            arguments->structureOutput = data;
+            return kIOReturnSuccess;
+        }
         default:
             return kIOReturnUnsupported;
     }
