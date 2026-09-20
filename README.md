@@ -91,6 +91,10 @@ interleaving register transactions and what lets a setting survive the next rate
 | `uf-busreset` | force a FireWire bus reset, to exercise topology-change recovery |
 | `uf-testsig` | generate and verify a self-describing bit-exactness test signal (needs no hardware) |
 
+Every flag, subcommand and environment variable is documented in
+[`docs/tools.md`](docs/tools.md); the terminal mixer has its own page,
+[`docs/tui.md`](docs/tui.md).
+
 ## Protocol reference
 
 [`spec/`](spec/) documents the FF800 protocol the driver implements: the 48-bit register map, the
