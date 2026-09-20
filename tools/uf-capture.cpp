@@ -5,7 +5,7 @@
 // snd-fireface ff800_allocate_resources/begin_session); the host-only steps live here: poll the
 // device-assigned TX channel, start the OHCI IR context, then begin the session.
 //
-//   uf-capture [--rate=48000] [--packets=2048] [out.wav]
+//   uf-capture [--rate=48000] [--packets=512] [out.wav]
 #include <IOKit/IOKitLib.h>
 #include <cstdint>
 #include <cstdio>
@@ -105,7 +105,7 @@ static void clear_stale_session(io_connect_t c) {
 }
 
 int main(int argc, char** argv) {
-    uint32_t rate = 48000, packets = 2048;
+    uint32_t rate = 48000, packets = kMaxPackets;
     const char* path = "capture.wav";
     for (int i = 1; i < argc; ++i) {
         if (!std::strncmp(argv[i], "--rate=", 7)) rate = (uint32_t)std::atoi(argv[i] + 7);

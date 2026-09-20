@@ -133,7 +133,8 @@ goes through the daemon, so it survives a rate change and a daemon restart; `raw
 itself, shares the AT context with a running daemon, and does not survive a session restart.
 
 Each command first prints what it will do (as `wq(addr, value)` where there is a register behind
-it), then `sent` once the daemon has taken it. Bad arguments exit 2, a failed send exits 1.
+it), then `sent` once the daemon has taken it. Bad arguments exit 2, a failed send exits 1. `--phantom=` takes whole channel numbers, 7 to 10, in any order and with any
+separator; any other number exits 2.
 
 ```console
 $ uf-mix in 3 1 -6
@@ -166,7 +167,7 @@ uf-set [options]
 | `--in=lo\|+4\|-10` | `+4` | Input level. |
 | `--out=hi\|+4\|-10` | `+4` | Output level. |
 | `--phones=+4\|-10\|hi` | `+4` | Headphone level. |
-| `--phantom=7,8,9,10` | all off | Phantom power on the listed mic inputs. |
+| `--phantom=<list>` | all off | Phantom power on the listed mic inputs, e.g. `7,8` or `9,10`. |
 | `--input1=`, `--input7=`, `--input8=` | unset | `front` or `rear` jack for that input. |
 | `--filter` | off | Channel-1 instrument filter. |
 | `--drive` | off | Channel-1 drive. |
@@ -208,15 +209,14 @@ uf-capture [--rate=48000] [--packets=N] [--bank=0002|fc88f] [--hold=N] [--led-sw
 | Flag | Default | What it does |
 |---|---|---|
 | `--rate=<hz>` | `48000` | Session rate; sets channel count and frames per packet. |
-| `--packets=<n>` | `2048` | Packets to capture. Must be 1..512 or the tool exits 2. |
+| `--packets=<n>` | `512` | Packets to capture. Must be 1..512 or the tool exits 2. |
 | `--bank=0002` | selected | Drive streaming from the `0x0002` register bank. |
 | `--bank=fc88f` | — | Use the legacy `fc88f` bank instead. |
 | `--hold=<sec>` | `0` | Hold the session open, then close it and exit. |
 | `--led-sweep` | off | Sweep the host-LED register, ~4 s a value, then exit. |
 | *(positional)* | `capture.wav` | Output path; any non-flag argument is taken as it. |
 
-Because the default 2048 is outside the accepted 1..512, a `--packets` value has to be given in
-practice. `--led-sweep` and `--hold` both close the session and exit without writing a WAV, and
+`--led-sweep` and `--hold` both close the session and exit without writing a WAV, and
 `UF_DUMP` in the environment dumps the head of the first two capture slots before decoding. The
 session is always torn down before exit. It exits 1 if the dext is unavailable, if the device
 never published a transmit channel, if no packets arrived, or if they decoded to no frames.
@@ -361,7 +361,8 @@ uf-flash erase-settings --force
 Reads are safe, and `read` requires both arguments. `erase-settings` is gated: without `--force`
 it prints `erase is DESTRUCTIVE — pass --force. UNTESTED on hardware.` and exits 2 without
 touching anything. With `--force` it writes the erase register, then polls until the flash
-reports ready, printing `erased (flash ready)` or `timeout waiting for flash ready`. It is
+reports ready, printing `erased (flash ready)`, or exiting 1 with `timeout waiting for flash
+ready`. It is
 untested on hardware, and there is no write subcommand. Like the other dext tools it opens the
 user client directly: exit 1 if that fails, 2 for an unknown or incomplete command.
 
@@ -384,7 +385,7 @@ uf-busreset [count]
 
 `count` defaults to 1; anything below 1 is treated as 1. There are no flags. With more than one,
 it waits 2 s between resets so the bus can settle and the daemon can react. Each reset prints
-its kernel return code, and the tool exits 0 if the last one succeeded.
+its kernel return code, and the tool exits 0 only if every reset succeeded.
 
 Expect, in order: the dext logs a bus reset and re-identifies the FF800, capture stalls briefly,
 and the daemon reports `RESTART (capture stalled — device wedged)` and rebuilds. Silence with no

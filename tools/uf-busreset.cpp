@@ -30,13 +30,15 @@ int main(int argc, char** argv) {
     IOObjectRelease(svc);
     if (kr != KERN_SUCCESS) { std::fprintf(stderr, "uf-busreset: open failed 0x%x\n", kr); return 1; }
 
+    bool allOk = true;
     for (int i = 0; i < count; ++i) {
         kr = IOConnectCallScalarMethod(conn, kUFOhciForceBusReset, nullptr, 0, nullptr, nullptr);
+        if (kr != KERN_SUCCESS) allOk = false;
         std::printf("bus reset %d/%d -> 0x%x%s\n", i + 1, count, kr,
                     kr == KERN_SUCCESS ? "" : "  (FAILED)");
         std::fflush(stdout);
         if (i + 1 < count) sleep(2);   // let the bus settle and the daemon react between resets
     }
     IOServiceClose(conn);
-    return kr == KERN_SUCCESS ? 0 : 1;
+    return allOk ? 0 : 1;
 }

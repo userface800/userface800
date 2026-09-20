@@ -50,7 +50,8 @@ static bool wblock(io_connect_t c, uint64_t off, const uint32_t* q, uint32_t n) 
            == KERN_SUCCESS;
 }
 
-// Poll SR1 until the flash-ready bit is set (FFADO wait_while_busy).
+// Poll SR1 until the flash-ready bit is set. The bit reads 1 when the flash is idle, so this
+// returns true once the device is ready and false if it never becomes ready.
 static bool wait_ready(io_connect_t c, int init_ms) {
     for (int i = 0; i < 25; ++i) {
         usleep(init_ms * 1000);
@@ -95,7 +96,12 @@ int main(int argc, char** argv) {
         if (!force) { std::fprintf(stderr, "erase is DESTRUCTIVE — pass --force. UNTESTED on hardware.\n"); return 2; }
         std::printf("erasing settings block...\n");
         if (!wq(conn, uf::reg::kFlashEraseSettings, 0)) { std::fprintf(stderr, "erase write failed\n"); return 1; }
-        std::printf(wait_ready(conn, 500) ? "erased (flash ready)\n" : "timeout waiting for flash ready\n");
+        if (!wait_ready(conn, 500)) {
+            std::fprintf(stderr, "timeout waiting for flash ready\n");
+            IOServiceClose(conn);
+            return 1;
+        }
+        std::printf("erased (flash ready)\n");
         usleep(20000);
     } else {
         std::fprintf(stderr, "unknown/incomplete command\n"); IOServiceClose(conn); return 2;

@@ -5,11 +5,10 @@
 // completely different causes and they need different actions. Then the DEVICE view: clock, sync
 // source and per-input lock, decoded by the portable protocol core.
 //
-// The device half prefers the daemon's shared-memory ring over touching the hardware. The dext has a
-// SINGLE AT context with no serialisation, so a second user client issuing register reads can
-// interleave with the daemon's own transactions. Reading rate/clock out of the ring costs the device
-// nothing and cannot collide; direct register reads are the fallback for when no daemon is running,
-// which is exactly when they are safe.
+// The daemon's own view is printed from the published shared-memory state, which costs the device
+// nothing. The device half then reads the status registers directly, which is the only way to get
+// them when no daemon is running. Note the dext has a SINGLE AT context with no serialisation, so
+// those reads can interleave with a running daemon's transactions.
 #include <IOKit/IOKitLib.h>
 #include <fcntl.h>
 #include <sys/mman.h>

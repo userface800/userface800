@@ -104,11 +104,21 @@ int main(int argc, char** argv) {
         else if (is("--spdif-nonaudio"))    s.spdif_out_nonaudio = true;
         // phantom
         else if (pfx("--phantom=")) {
-            for (const char* p = a + 10; *p; ++p) {
-                if (*p == '7') s.phantom7 = true;
-                if (*p == '8') s.phantom8 = true;
-                if (*p == '9') s.phantom9 = true;
-                if (*p == '1') s.phantom10 = true;   // "10"
+            // A list of channel numbers: 7,8,9,10 in any order and any separator. Parse whole
+            // numbers — scanning for digits would make "10" also mean 1, and "1" mean 10.
+            for (const char* p = a + 10; *p; ) {
+                if (*p < '0' || *p > '9') { ++p; continue; }
+                unsigned n = 0;
+                while (*p >= '0' && *p <= '9') { n = n * 10 + (unsigned)(*p - '0'); ++p; }
+                switch (n) {
+                    case 7:  s.phantom7  = true; break;
+                    case 8:  s.phantom8  = true; break;
+                    case 9:  s.phantom9  = true; break;
+                    case 10: s.phantom10 = true; break;
+                    default:
+                        std::fprintf(stderr, "uf-set: phantom power exists on inputs 7-10, not %u\n", n);
+                        return 2;
+                }
             }
         }
         else { std::fprintf(stderr, "unknown flag: %s (try --help)\n", a); return 2; }
