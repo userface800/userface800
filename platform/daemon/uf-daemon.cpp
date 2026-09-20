@@ -541,7 +541,8 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
     // factory driver writes the same 28-quadlet block). We have NEVER written this. It is the one
     // playback-side register both reference drivers touch and we don't.
     //
-    // Now driven by the mixer model: this register IS TotalMix's Loopback (manual §27.5), one flag
+    // Now driven by the mixer model: this register IS the device's loopback (manual §27.5), one
+    // flag
     // per hardware output, so it has to be re-applied on every session start alongside the matrix or
     // a rate change silently drops the user's loopbacks. UF_REC still forces every output on.
     mixer_init_once(dbq);
@@ -622,7 +623,7 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
         fullPayload = sytInterval * dbq * 4;
         fullCount   = uf::blocking_full_count(rate, speed);              // full packets in the 640-ring
     }
-    // [2] TotalMix matrix: zero every gain, then route each FireWire playback channel to its own
+    // [2] matrix mixer: zero every gain, then route each FireWire playback channel to its own
     // physical output at unity + bring the per-output faders to unity (zeroing set them to 0 = mute).
     // FF800 layout (ffado set_hardware_mixergain): per-output block 0x100; playback src at +0x80+4*src;
     // output fader block at 0x1f80. Unity = 0x8000, mute = 0. (Before comm-start.)
@@ -637,7 +638,7 @@ static bool session_start(io_connect_t conn, uint32_t rate, Session* out) {
         // the device's RAM is garbage until we say otherwise.
         g_model.render(g_mixer);
         g_mixer.apply_all([&](uf::Addr a, uint32_t v) { wq(conn, a, v); });
-        if (!g_sessionQuiet) std::printf("uf-daemon: [2] TotalMix matrix applied from the shadow\n");
+        if (!g_sessionQuiet) std::printf("uf-daemon: [2] matrix mixer applied from the shadow\n");
     }
 
     // [3] comm-start — BEFORE the iso streams, so the device is armed for playback when our transmit

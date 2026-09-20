@@ -363,7 +363,8 @@ public:
              const aspl::StreamParameters& p, uint32_t channels)
         : aspl::Stream(std::move(ctx), std::move(dev), p), channels_(channels) {}
 
-    // The SAME channel count at every rate, which is what the factory driver does — TotalMix shows
+    // The SAME channel count at every rate, which is what the factory driver does — the device's
+    // own mixer shows
     // 20 channels at 96 kHz while CoreAudio still sees 28.
     //
     // The device really does carry fewer channels as the rate rises (ADAT halves at 2x, vanishes at

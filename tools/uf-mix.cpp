@@ -1,4 +1,4 @@
-// uf-mix — drive the FF800's TotalMix matrix mixer from the command line, through the dext.
+// uf-mix — drive the FF800's matrix mixer from the command line, through the dext.
 //
 // Uses the portable uf::mixer addressing + dB->coefficient math (spec/07, transcribed from FFADO
 // fireface_hw.cpp::set_hardware_mixergain) and writes single quadlets to the matrix RAM via the
@@ -6,7 +6,8 @@
 // own DSP, so a route set here is audible immediately (zero-latency monitoring), which is how we
 // confirm the addressing by ear.
 //
-// Channel numbers on the command line are 1-based (as on the front panel / in TotalMix); they map to
+// Channel numbers on the command line are 1-based (as on the front panel / in the device's own
+// mixer); they map to
 // the 0-based src/dest indices the matrix uses. dB defaults to 0 (unity).
 //
 //   uf-mix in 3 1            # physical input 3 -> output 1 at 0 dB (unity monitor)
@@ -54,7 +55,7 @@ static void usage() {
         "  mute  in|pb <src> <dst> on|off   mute a crosspoint, keeping its gain\n"
         "  phase in|pb <src> <dst> on|off   invert phase 180 deg (negative coefficient)\n"
         "  omute <out> on|off            mute a hardware output\n"
-        "  loopback <out> on|off         send that output's mix to the recorder (TotalMix Loopback)\n"
+        "  loopback <out> on|off         send that output's mix to the recorder (device loopback)\n"
         "  stereo in|pb <ch> on|off      pair ch with its neighbour (host-side view/edit only)\n"
         "  pan   in|pb <src> <dstL> <-1..1> [dB]   spread across the dstL/dstL+1 output pair\n"
         "  copy  <fromOut> <toOut>       copy a whole submix column\n"

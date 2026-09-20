@@ -11,7 +11,7 @@ kernel FireWire stack at all. UserFace800 supplies the whole path from user spac
 | `platform/daemon/` | `uf-daemon`, which owns the FF800 through the dext, runs the streaming session, and bridges audio over lock-free shared memory |
 | `platform/coreaudio/` | `UFAudioDriver`, an AudioServerPlugIn that presents the FF800 to Core Audio |
 | `platform/midi/` | a CoreMIDI bridge for the FF800's DIN ports (also carried inside `uf-daemon`) |
-| `tools/`, `tui/` | command-line tools and a terminal TotalMix mixer |
+| `tools/`, `tui/` | command-line tools and a terminal mixer |
 
 `include/uf/protocol/` is the portable protocol core — registers, packet codec, channel maps, MIDI
 framing, mixer math — pure C++ with no macOS dependencies, unit-tested with `ctest`.
@@ -23,7 +23,7 @@ Working on hardware:
 - **Capture and playback** at every native rate (44.1/48, 88.2/96, 176.4/192 kHz), full channel
   count for the speed class (28/20/12).
 - **MIDI** in and out, as a CoreMIDI source and destination.
-- **TotalMix matrix** — crosspoint gains, phase, mutes, output faders, per-output loopback. Routes
+- **matrix mixer** — crosspoint gains, phase, mutes, output faders, per-output loopback. Routes
   survive a rate change, a bus reset and a daemon restart.
 - **Metering** — per-channel peak and RMS for inputs and playback.
 - **Sleep/wake** — the dext rebuilds the controller on wake and the daemon rides the gap out.
@@ -79,7 +79,7 @@ interleaving register transactions and what lets a setting survive the next rate
 | tool | what it does |
 |---|---|
 | `uf-daemon` | owns the device, streams isochronous audio, bridges to the plug-in and to CoreMIDI |
-| `uf-tui` | terminal TotalMix: the live matrix, arrows to move, `u`/`m`/`+`/`-` to set |
+| `uf-tui` | terminal mixer: the live matrix, arrows to move, `u`/`m`/`+`/`-` to set |
 | `uf-status` | decode and print the device's status registers — clock, lock, sync, rate |
 | `uf-set` | change settings: clock source, sample rate, phantom, input/output levels, SPDIF |
 | `uf-mix` | drive the matrix from the command line: routes, faders, mutes, phase, loopback, pan |
@@ -99,7 +99,7 @@ Every flag, subcommand and environment variable is documented in
 
 [`spec/`](spec/) documents the FF800 protocol the driver implements: the 48-bit register map, the
 CR/SR bitfields, the isochronous packet format and channel maps, the streaming lifecycle, MIDI
-framing, the TotalMix matrix maths, metering and the on-device flash. Facts still carrying a `[?]`
+framing, the matrix mixer maths, metering and the on-device flash. Facts still carrying a `[?]`
 are flagged there.
 
 ## Licence

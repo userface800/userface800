@@ -100,7 +100,7 @@ rate:    48000 Hz  (clock Internal, locked)
 
 ## uf-mix
 
-Drives the TotalMix matrix: crosspoints, faders, mutes, phase, loopback, stereo pairing, pan and
+Drives the matrix mixer: crosspoints, faders, mutes, phase, loopback, stereo pairing, pan and
 whole-submix copy or clear. Channel numbers are 1-based, as on the front panel, and must be
 within 1..28; dB may be negative or fractional and defaults to 0 (unity).
 

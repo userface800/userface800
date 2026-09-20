@@ -2,7 +2,7 @@
 //
 // MixerShadow (uf_mixer_shadow.hpp) is a device image: 2048 raw quadlets, one per matrix cell. That
 // is enough to re-apply a routing after a rate change, and it was enough while the only operation
-// was "set this crosspoint to this gain". It is not enough for TotalMix's actual feature set, and
+// was "set this crosspoint to this gain". It is not enough for the mixer's actual feature set, and
 // the reason is worth stating precisely, because it is the whole justification for this file:
 //
 //   **Muting a crosspoint writes 0 to it.** If 0 is all we store, the gain that was there is gone,
@@ -15,14 +15,14 @@
 //
 // ## What is device state and what is not
 //
-// Reading the FF800 manual (§25-§27) against FFADO's register code, TotalMix's features split
+// Reading the FF800 manual (§25-§27) against FFADO's register code, the mixer's features split
 // cleanly, and only the first group exists in hardware:
 //
 //   DEVICE   crosspoint gains (signed: sign = phase), per-output faders, the channel-mute mask at
 //            0x801c0000, and the output-record mask at 0x801c0080 (= "Loopback").
 //   HOST     stereo pairing, pan, mute, solo, width, M/S, trim, cue, talkback, groups, snapshots.
 //
-// Everything in the second group is TotalMix computing crosspoints. Pan is the clearest case: a
+// Everything in the second group is the mixer computing crosspoints. Pan is the clearest case: a
 // source panned between a stereo output pair is just its two crosspoints at different gains, which
 // is why the manual can say the Matrix "operates monaural" (§26.3) and still be a complete view of
 // the mixer. So this model does NOT store pan: it stores crosspoints, and offers pan as an EDIT that
@@ -47,7 +47,7 @@ namespace uf {
 inline constexpr uint8_t kMfNone     = 0x00;
 inline constexpr uint8_t kMfMuted    = 0x01;   // crosspoints and outputs
 inline constexpr uint8_t kMfInverted = 0x02;   // crosspoints only — phase 180°
-inline constexpr uint8_t kMfRec      = 0x04;   // OUTPUTS only — TotalMix "Loopback"
+inline constexpr uint8_t kMfRec      = 0x04;   // OUTPUTS only — the mixer's "Loopback"
 
 class MixerModel {
 public:
@@ -61,7 +61,7 @@ public:
         uint8_t  flags = kMfNone;
     };
 
-    // TotalMix's default and ours: every input crosspoint down, each playback channel to its own
+    // The device's default and ours: every input crosspoint down, each playback channel to its own
     // physical output at unity, every output fader at unity. `dbq` is the channel count at the
     // current rate (28 / 20 / 12); `diag` mirrors the daemon's UF_NODIAG escape hatch.
     void reset_defaults(uint32_t dbq, bool diag = true) {
@@ -147,11 +147,11 @@ public:
         for (uint32_t o = 0; o < kCh; ++o) sh.set_fader(o, quadlet(outputs_[o]));
     }
 
-    // The 28-quadlet output-record mask for 0x801c0080 — TotalMix's Loopback, per output.
+    // The 28-quadlet output-record mask for 0x801c0080 — the mixer's loopback, per output.
     //
     // A set output sends that output's MIX to the recording software in place of the corresponding
     // hardware input (manual §27.5). FFADO only ever writes it all-on or all-off
-    // (set_hardware_output_rec); per-output is what TotalMix actually exposes, and the register is
+    // (set_hardware_output_rec); per-output is what the mixer actually exposes, and the register is
     // already per-channel, so there is nothing to invent.
     std::array<uint32_t, kCh> rec_mask() const {
         std::array<uint32_t, kCh> m{};

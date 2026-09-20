@@ -12,7 +12,7 @@
 //
 // ## Layout: the Matrix, and why
 //
-// TotalMix has two views of one mixer (manual §26.1): a channel-strip mixer, and a Matrix that is a
+// The device's mixer has two views (manual §26.1): a channel-strip mixer, and a Matrix that is a
 // patchbay — sources down the side, hardware outputs across the top, a gain at each crosspoint. The
 // Matrix is the one worth having in a terminal. It shows every routing at once, it is monaural so
 // there is no stereo-pair bookkeeping in the way, and a grid of numbers is what a terminal is good
@@ -187,7 +187,7 @@ int main() {
     //
     // `selOut` is deliberately SHARED across all three: it is the submix being edited. Pick an
     // output on tab 3, switch to tab 1, and you are editing that output's monitor mix — which is
-    // TotalMix's Submix view (§25.5.1) expressed as navigation rather than as a mode.
+    // the mixer's submix view (§25.5.1) expressed as navigation rather than as a mode.
     //
     // The two source tabs keep their own cursor, so switching back returns to where you were rather
     // than to the top.
@@ -195,7 +195,7 @@ int main() {
     int selIn = 0, selPb = 0, selOut = 0;
     auto selSrcRef = [&]() -> int& { return row == Row::Playback ? selPb : selIn; };
     int selSrc = 0;                       // refreshed from selSrcRef() on every pass
-    bool submixView = true;    // dim everything but the selected output, as TotalMix does by default
+    bool submixView = true;    // dim all but the selected output, as the device's own mixer does
     std::string message = connected ? "" : ("not connected: " + connErr);
 
     auto screen = ScreenInteractive::Fullscreen();
@@ -334,7 +334,8 @@ int main() {
             //
             // Two columns scrolled independently. Something must be FOCUSED or ftxui's frame never
             // scrolls at all; and the labels have to stay put, because at 28 columns scrolling right
-            // would leave a grid of anonymous numbers. TotalMix has the same problem and the same
+            // would leave a grid of anonymous numbers. The device's own mixer has the same
+            // problem and the same
             // answer (§26.2: the labels are floating). The header and the grid are separate xframes
             // that stay in step because both carry a focus on the selected output column.
             constexpr int kGutter = 16;      // 9 label + 5 meter + a space, plus slack
@@ -398,7 +399,7 @@ int main() {
             where = inNames[selSrc] + "  ->  " + outNames[selOut];
 
         return vbox({
-            text("userface800 — TotalMix") | bold | center,
+            text("userface800 — mixer") | bold | center,
             text(hdr) | center,
             tabs,
             separator(),

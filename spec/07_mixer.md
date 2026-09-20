@@ -1,4 +1,4 @@
-# 07 — TotalMix matrix mixer
+# 07 — matrix mixer
 
 Transcribed facts from FFADO `fireface_hw.cpp::set_hardware_mixergain`. The mixer is
 optional (needed only for zero-latency monitoring). snd-fireface does not implement it.
@@ -7,7 +7,7 @@ optional (needed only for zero-latency monitoring). snd-fireface does not implem
 Each mixer element is a single **quadlet** written to the matrix RAM.
 - The coefficient is **SIGNED**: the magnitude is the gain, and a **negative value inverts the phase
   by 180°**. FFADO validates `abs(val) <= 0x10000` (`set_hardware_mixergain`) and negates the value
-  when a crosspoint carries `FF_SWPARAM_MF_INVERTED`; the TotalMix Matrix draws such a crosspoint red
+  when a crosspoint carries `FF_SWPARAM_MF_INVERTED`; the matrix view draws such a crosspoint red
   (manual §26.2).
 - Range `0x00000` (mute) … `0x10000` (+6 dB), and the negatives of those. **`0x8000` = 0 dB.**
 - **Hardware quirk `[from FFADO]`:** going from `0` (−inf) to `-1` (−90 dB) makes the FF800 run the
@@ -37,14 +37,14 @@ Notes:
 ## 7.3 Mute / record masks
 - **Channel-mute mask** — block-write to `0x801c0000` (write side; read side is SR0). One quadlet per
   channel (28 for FF800). Muting can also be done by writing coefficient `0`.
-- **Output-record mask** — `0x801c0080`. **This is TotalMix's "Loopback"** (manual §27.5): a set
+- **Output-record mask** — `0x801c0080`. **This is the mixer's "Loopback"** (manual §27.5): a set
   output sends its MIX to the recording software in place of the corresponding hardware input, which
   still reaches the mixer. 28 quadlets, one per output, block-written. FFADO only ever writes it
   all-on or all-off (`set_hardware_output_rec`); the register is per-channel, so per-output loopback
   needs nothing invented. **Re-apply it at every session start** alongside the matrix, or a rate
   change silently drops it.
 
-## 7.3a Which TotalMix features are device state
+## 7.3a Which mixer features are device state
 Sorting the manual (§25–§27) against FFADO's register code, only the first group exists in hardware:
 
 | | |
@@ -52,7 +52,7 @@ Sorting the manual (§25–§27) against FFADO's register code, only the first g
 | **DEVICE** | crosspoint gains (signed), per-output faders, channel-mute mask `0x801c0000`, output-record mask `0x801c0080` |
 | **HOST** | stereo pairing, pan, mute, solo, width, M/S, trim, cue, talkback, groups, snapshots, workspaces |
 
-Everything in the second group is TotalMix computing crosspoints. **Pan** is the clearest case: a
+Everything in the second group is the mixer computing crosspoints. **Pan** is the clearest case: a
 source panned across a stereo output pair is just its two crosspoints at different gains (−3 dB at
 centre), which is why the manual can say the Matrix "operates monaural" (§26.3) and still be a
 complete view of the mixer.

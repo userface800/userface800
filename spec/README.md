@@ -39,7 +39,7 @@ the device's own behaviour on hardware. Untagged statements are settled. Tags:
 - **In scope:** a userland (no kext) macOS driver exposing the FF800 to Core Audio and CoreMIDI —
   control, status, isochronous full-duplex audio, mixer, MIDI.
 - **Out of scope (for now):** firmware flashing, the TCO time-code option card beyond basic sync,
-  TotalMix GUI parity.
+  mixer GUI parity.
 - **Non-goals:** a kernel extension; supporting the FF400/UFX/UCX (the code should not preclude
   them, but only the FF800 is specified/tested).
 

@@ -1,4 +1,4 @@
-// mixer.hpp — TotalMix matrix RAM addressing + coefficient math + mute/rec masks (portable).
+// mixer.hpp — matrix mixer RAM addressing + coefficient math + mute/rec masks (portable).
 //
 // The mixer is optional (zero-latency monitoring only); snd-fireface doesn't implement it. Facts
 // from spec/07 (transcribed from FFADO fireface_hw.cpp::set_hardware_mixergain, GPL-2.0). Validated
@@ -25,13 +25,13 @@ inline constexpr u32 kMixerMax = 0x10000;    // +6 dB
 
 // Which half of a destination's 0x100-byte block a coefficient lives in. Not a flat src x dest grid:
 // physical inputs occupy the first 0x80, playback streams the second, so "which kind of source" is
-// part of the address rather than a detail (spec/07 §7.2). TotalMix's three rows are exactly this
+// part of the address rather than a detail (spec/07 §7.2). The mixer's three rows are exactly this
 // distinction — hardware inputs, software playback, hardware outputs (manual §25.2).
 enum class MixerSrcKind : u16 { Input = 0, Playback = 1 };
 
 // The coefficient is SIGNED: a NEGATIVE value inverts the phase by 180°. FFADO validates
 // `abs(val) <= 0x10000` in set_hardware_mixergain and negates the value when a crosspoint carries
-// FF_SWPARAM_MF_INVERTED; the TotalMix Matrix draws such a crosspoint red (manual §26.2). So the
+// FF_SWPARAM_MF_INVERTED; the matrix view draws such a crosspoint red (manual §26.2). So the
 // magnitude is the gain and the sign is the phase — one quadlet carries both.
 inline constexpr i32 kMixerMinCoeff = -static_cast<i32>(kMixerMax);
 

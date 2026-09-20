@@ -1,6 +1,6 @@
 # 11 — On-device flash (persistent settings / NVRAM)
 
-The FF800 stores its settings and the TotalMix mixer state in on-board flash so they survive power-off
+The FF800 stores its settings and the mixer state in on-board flash so they survive power-off
 and drive the unit standalone (RME's "Store in Flash Memory" button). Facts transcribed from FFADO
 `fireface_flash.cpp` / `fireface_def.h` (`[F]`); the on-wire protocol is single async R/W, same
 transport as every other register. **Not yet exercised on hardware** (`[?]` on layout).
@@ -9,7 +9,7 @@ transport as every other register. **Not yet exercised on hardware** (`[?]` on l
 | region | address | notes |
 |---|---|---|
 | settings record | `0x3_000f0000` | the persisted device settings |
-| mixer shadow | `0x3_000e0000` | TotalMix state, `0x2000` bytes |
+| mixer shadow | `0x3_000e0000` | mixer state, `0x2000` bytes |
 | mixer volume / pan / hw | `0x3_000e2000` / `…2800` / `…3000` | |
 | firmware revision (read) | `0x2_00000100` | `uf::reg::kFirmwareRev` |
 | erase settings | `0x3_fffffff0` | write 0 to erase |

@@ -1,6 +1,6 @@
 # uf-tui — the terminal mixer
 
-`uf-tui` is a terminal front-end for the Fireface 800's TotalMix matrix: crosspoint gains,
+`uf-tui` is a terminal front-end for the Fireface 800's matrix mixer: crosspoint gains,
 per-output faders, mutes, phase, loopback, stereo pairing and submix copy/clear, plus live input
 and playback meters.
 
@@ -38,7 +38,7 @@ refused at the handshake and named on the status line. Both messages ask for a r
 
 ```
 +---------------------------------------------------------------------------+
-|                          userface800 — TotalMix                           |
+|                            userface800 — mixer                            |
 |               48000 Hz   clock Internal (locked)   28 ch                  |
 |  1 inputs    2 playback    3 outputs           submix: Analog 1   v focus |
 |---------------------------------------------------------------------------|

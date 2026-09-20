@@ -18,7 +18,7 @@ with a recommendation.
 | `0x801c0008` | R | 1 quad | **TX iso channel** — device-assigned capture channel (`0xffffffff` until ready) | snd-fireface |
 | `0x801c001c` | R | 1 quad | status 3 | FFADO [F] |
 | `0x801c0080` | W | — | output/record mask | FFADO |
-| `0x80080000` | W | matrix | **TotalMix matrix mixer RAM** | FFADO |
+| `0x80080000` | W | matrix | **matrix mixer RAM** | FFADO |
 | `0x80180000` | W | 1 quad/byte | **MIDI-out (host→device)** — see `04_midi.md` | snd-fireface |
 | `0x200000320` | W | 1 quad | **MIDI host-receive high-addr register** — see `04_midi.md` | snd-fireface [F] |
 | `0x200000100` | R | 1 quad | firmware revision | — |
@@ -80,6 +80,6 @@ input options, filter/drive, SPDIF format, clock mode, sync ref, limiter, drop-a
 are left 0. **Complete bit tables + assembly rules in [`06_bitfields.md`](06_bitfields.md).**
 
 ## 2.6 Mixer (`0x80080000`)
-TotalMix matrix mixer RAM — per-output input/playback coefficients + output faders, plus mute/rec
+matrix mixer RAM — per-output input/playback coefficients + output faders, plus mute/rec
 masks (`0x801c0000`/`0x801c0080`). 0 dB = `0x8000`. Not required for playback/record; needed for
 zero-latency monitoring. **Complete addressing + coefficient encoding in [`07_mixer.md`](07_mixer.md).**

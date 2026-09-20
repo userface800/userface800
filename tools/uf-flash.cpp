@@ -1,6 +1,6 @@
 // uf-flash — read/erase/write the FF800's on-device flash (NVRAM) through the dext.
 //
-// The FF800 persists its settings (and the TotalMix mixer state) in flash so they survive power-off
+// The FF800 persists its settings (and the mixer state) in flash so they survive power-off
 // and drive the unit standalone. Protocol adapted from FFADO fireface_flash.cpp (spec/11):
 //   read:  quadlet reads of the flash address region (our dext has no block-read yet).
 //   erase: write 0 to the erase register, then poll SR1 (0x801c0004) bit 30 until ready.

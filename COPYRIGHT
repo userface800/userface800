@@ -15,8 +15,8 @@ Upstream sources this work derives from
                                                     register sequences
   Linux firewire core / ohci  GPL-2.0, -or-later    1394 OHCI programming model,
                                                     async transactions, self-ID
-  FFADO (libffado)            GPL-2.0-or-later      extended settings, TotalMix
-                                                    matrix mixer maths
+  FFADO (libffado)            GPL-2.0-or-later      extended settings, matrix mixer
+                                                    maths
 
 Each file that derives from one of these carries an attribution header naming
 the upstream file and its licence. Keep that up when porting anything new.
